@@ -1,0 +1,28 @@
+# k0s component images, k0s v1.28.15 (Kubernetes 1.28.15)
+#
+# These are the images k0s itself pulls, one per line, in the same shape as
+# images/k8s/<version>/images.list. build-offline-bundle.sh reads this file, so
+# a change here is a change to the bundle.
+#
+# The CNI's own images live beside this file: images-cni-calico.list and
+# images-cni-kuberouter.list. Cilium has no file here on purpose: its images are
+# decided by the Cilium chart, and the bundle reads them from the rendered chart
+# rather than from a list that would go stale on the next Cilium release.
+#
+# registry.k8s.io is not reachable from every network; the bundle builder falls
+# back to registry.cn-hangzhou.aliyuncs.com/google_containers, which carries the
+# same images under a flat name.
+
+quay.io/k0sproject/coredns:1.11.3
+quay.io/k0sproject/apiserver-network-proxy-agent:v0.1.4
+registry.k8s.io/metrics-server/metrics-server:v0.7.2
+
+# The sandbox image, imported under this exact name. k0s composes the reference
+# as "<image>:<tag>", so overriding spec.images.pause in the cluster config
+# produces "pause:3.8:3.8" and every pod sandbox fails.
+registry.k8s.io/pause:3.8
+
+# Only needed when kube-proxy is enabled. With Cilium and
+# CILIUM_KUBE_PROXY_REPLACEMENT="true" the bundle builder drops this line, since
+# k0s is told not to run kube-proxy at all.
+quay.io/k0sproject/kube-proxy:v${K0S_VERSION}

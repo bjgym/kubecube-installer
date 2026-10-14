@@ -124,6 +124,14 @@ function kubectl_with_retry() {
 }
 
 function helm_download() {
+  # Only a host that has no helm needs the download. The offline bundle installs
+  # helm itself, and reaching for the distribution host from a machine with no
+  # network turns a working install into a failed wget.
+  if command -v helm > /dev/null 2>&1; then
+    clog info "helm is already installed: $(helm version --short)"
+    return 0
+  fi
+
   clog info "download helm bin"
   if [[ $(arch) == x86_64 ]]; then
     wget https://kubecube.nos-eastchina1.126.net/helm/helm-v3.5.4-linux-amd64.tar.gz -O helm.tar.gz

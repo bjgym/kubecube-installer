@@ -1,0 +1,8 @@
+# k0s calico images, k0s v1.28.15
+#
+# k0s installs calico itself when the cluster config says provider: calico, from
+# its own repackaged images. Used when CNI="calico".
+
+quay.io/k0sproject/calico-cni:v3.26.1-1
+quay.io/k0sproject/calico-node:v3.26.1-1
+quay.io/k0sproject/calico-kube-controllers:v3.26.1-1

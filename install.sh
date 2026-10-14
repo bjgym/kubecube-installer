@@ -33,6 +33,19 @@ function params_process() {
       exit 1
   fi
 
+  # check KUBERNETES_DISTRO. A configuration written before the k0s provider
+  # existed has no such key, and that configuration means kubeadm.
+  if [ -z ${KUBERNETES_DISTRO} ]; then
+    KUBERNETES_DISTRO="kubeadm"
+  fi
+  case "${KUBERNETES_DISTRO}" in
+    kubeadm | k0s) ;;
+    *)
+      clog error "KUBERNETES_DISTRO illegal! must be one of:kubeadm,k0s"
+      exit 1
+      ;;
+  esac
+
   # check MASTER_IP
   if [ -z ${MASTER_IP} ]; then
     if [ ${NODE_MODE} = "master" ]; then
@@ -57,7 +70,15 @@ params_process
 
 # install k8s or not
 if [[ ${INSTALL_KUBERNETES} = "true" ]]; then
-  /bin/bash /etc/kubecube/manifests/install_k8s.sh
+  # the distribution owns everything below the API server: which binaries, which
+  # container runtime, and which CNI it can install itself.
+  case "${KUBERNETES_DISTRO}" in
+    kubeadm) k8s_provider="install_k8s.sh" ;;
+    k0s) k8s_provider="install_k0s.sh" ;;
+  esac
+
+  clog info "installing kubernetes with ${KUBERNETES_DISTRO}"
+  /bin/bash /etc/kubecube/manifests/${k8s_provider}
   if [ "$?" -ne 0 ]; then
     clog error "install kubernetes failed"
       exit 1
