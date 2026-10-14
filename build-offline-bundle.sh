@@ -84,7 +84,7 @@ function normalize_lines() {
       n=$((n + 1))
     fi
   done < <(find "${dir}" -type f \( -name '*.sh' -o -name 'Dockerfile' -o -name '*.yaml' -o -name '*.yml' \
-    -o -name '*.conf' -o -name '*.list' -o -name '*.json' -o -name '*.md' \) -print0)
+    -o -name '*.tpl' -o -name '*.conf' -o -name '*.list' -o -name '*.json' -o -name '*.md' \) -print0)
   if [ "${n}" -gt 0 ]; then
     log "normalized line endings in ${n} file(s) under ${dir}"
   fi
@@ -172,6 +172,11 @@ function build_charts() {
   rm -rf "${OUT}/charts/kubecube-chart"
   cp -a "${WORKSPACE}/kubecube-chart" "${OUT}/charts/kubecube-chart"
   rm -rf "${OUT}/charts/kubecube-chart/.git"
+  # The chart travels as it is written, and a Windows checkout hands it over
+  # with CRLF. YAML survives that; a template that emits a value into a base64
+  # field does not — the carriage return lands inside the base64 — so the chart
+  # is normalised like everything else that runs on the target.
+  normalize_lines "${OUT}/charts/kubecube-chart"
 
   log "packaging the third-party charts (hotplugs)"
   # Everything that runs on the target is built from a normalised copy, so a

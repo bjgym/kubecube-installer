@@ -29,6 +29,10 @@
   neither, so a k0s install was refused before it started
 - `install_kubecube.sh` reads the image tag from the bundle instead of leaving
   the chart's upstream tags in place, which no arm64 cluster can pull
+- `build-offline-bundle.sh` normalises the chart it vendors, and matches `*.tpl`.
+  A template that emits a value into a base64 field carries a carriage return
+  into that base64 when the file comes from a Windows checkout: YAML tolerates
+  CRLF, a webhook's caBundle does not
 
 # v1.3.1
 
