@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+#
+# Installs the platform's member side into a cluster that a pivot elsewhere
+# manages.
+#
+# A member is the same chart with the pivot's own components switched off. That
+# single switch is what makes the chart render a member: with
+# componentsEnable.kubecube off, the warden agent dials the pivot at
+# global.nodeIP:30443 instead of an in-cluster service, and it registers itself
+# with the pivot (wardenRegisterModeEnable is on by default), so nothing is ever
+# pushed into this cluster from the other side.
+#
+# Everything it needs is already in the offline bundle: the same images, the same
+# chart, the same tag.
+#
+# Install it with INSTALL_KUBECUBE_MEMBER="true" and:
+#
+#   PIVOT_CUBE_HOST   the pivot's reachable API NodePort, <pivotIP>:30443
+#   PIVOT_KUBECONFIG  a kubeconfig for the pivot, which the warden uses to talk
+#                     to the platform (default /root/.kube/config)
+#   MEMBER_KUBECONFIG the kubeconfig of the cluster being joined
+#                     (default /etc/kubernetes/admin.conf)
+#   MEMBER_CLUSTER_NAME the name the member registers under (default: hostname)
+
+source /etc/kubecube/manifests/utils.sh
+source /etc/kubecube/manifests/install.conf
+
+# The bundle records the image tag it was built with; guessing it produces a
+# release that never pulls.
+if [ "${OFFLINE}" = "true" ]; then
+  if [ ! -f "${OFFLINE_BUNDLE_DIR}/bundle.env" ]; then
+    clog error "${OFFLINE_BUNDLE_DIR}/bundle.env is missing"
+    exit 1
+  fi
+  # shellcheck source=/dev/null
+  source "${OFFLINE_BUNDLE_DIR}/bundle.env"
+fi
+
+if [ -z "${KUBECUBE_IMAGE_TAG}" ]; then
+  clog error "KUBECUBE_IMAGE_TAG is empty: offline installs take it from bundle.env, online installs have to set it in install.conf"
+  exit 1
+fi
+
+if [ -z "${KUBECUBE_IMAGE_REGISTRY}" ]; then KUBECUBE_IMAGE_REGISTRY="docker.io"; fi
+if [ -z "${KUBECUBE_IMAGE_PROJECT}" ]; then KUBECUBE_IMAGE_PROJECT="kubecube"; fi
+
+PIVOT_CUBE_HOST=${PIVOT_CUBE_HOST:-}
+PIVOT_KUBECONFIG=${PIVOT_KUBECONFIG:-/root/.kube/config}
+MEMBER_KUBECONFIG=${MEMBER_KUBECONFIG:-/etc/kubernetes/admin.conf}
+MEMBER_CLUSTER_NAME=${MEMBER_CLUSTER_NAME:-$(hostname)}
+
+if [ -z "${PIVOT_CUBE_HOST}" ]; then
+  clog error "PIVOT_CUBE_HOST must be set to the pivot's API NodePort, for example 10.211.55.5:30443"
+  exit 1
+fi
+if [ ! -f "${MEMBER_KUBECONFIG}" ]; then
+  clog error "${MEMBER_KUBECONFIG} does not exist: point MEMBER_KUBECONFIG at this cluster's kubeconfig"
+  exit 1
+fi
+if [ ! -f "${PIVOT_KUBECONFIG}" ]; then
+  clog error "${PIVOT_KUBECONFIG} does not exist: the warden needs a kubeconfig for the pivot"
+  exit 1
+fi
+
+# The member registers by reporting its own kubeconfig, and the pivot then dials
+# the `server:` in it. A loopback address there registers the member
+# successfully and breaks every request afterwards, which reads as a broken
+# member rather than as a kubeconfig the pivot cannot reach.
+if grep -qE 'server:[[:space:]]*https?://(127\.0\.0\.1|localhost)' "${MEMBER_KUBECONFIG}"; then
+  clog error "${MEMBER_KUBECONFIG} points at a loopback address; the pivot has to be able to reach this cluster's API server"
+  exit 1
+fi
+
+# PIVOT_KUBECONFIG has to be the pivot's. If it is this cluster's own, the warden
+# registers the member into itself: the CRD is already here, the Cluster object
+# is created here, the pivot never hears about it — and the helm release still
+# goes green, so nothing points at the mistake.
+if ! KUBECONFIG="${PIVOT_KUBECONFIG}" kubectl -n "${INSTALL_NAMESPACE:-kubecube-system}" get deploy kubecube > /dev/null 2>&1; then
+  clog error "no kubecube deployment in ${INSTALL_NAMESPACE:-kubecube-system} through ${PIVOT_KUBECONFIG}: that kubeconfig does not point at a pivot"
+  exit 1
+fi
+
+# The chart's own namespace, so the member's warden lands where the pivot expects
+# to find it.
+NS=${INSTALL_NAMESPACE:-kubecube-system}
+
+# The pivot's JWT secret, written into both of the keys that have to agree. The
+# default is the chart's own default, which is what a pivot installed without
+# overriding it uses.
+PIVOT_JWT_SECRET=${PIVOT_JWT_SECRET:-56F0D8DB90241C6E}
+
+function render_values() {
+  clog info "render member values for the kubecube chart (image tag ${KUBECUBE_IMAGE_TAG})"
+  cat > member-values.yaml << EOF
+# Written by install_member.sh. The pivot's components are off, which is what
+# makes this a member rather than a pivot; see the comments at the top.
+global:
+  # The pivot's address: the member's warden dials it, because with
+  # componentsEnable.kubecube off the chart renders no in-cluster cube service to
+  # talk to.
+  nodeIP: ${PIVOT_CUBE_HOST%%:*}
+
+  hub:
+    registry: ${KUBECUBE_IMAGE_REGISTRY}
+    project: ${KUBECUBE_IMAGE_PROJECT}
+
+  images:
+    kubecube: kubecube:${KUBECUBE_IMAGE_TAG}
+    warden: warden:${KUBECUBE_IMAGE_TAG}
+    wardenInit: warden-init:${KUBECUBE_IMAGE_TAG}
+    audit: audit:${KUBECUBE_IMAGE_TAG}
+    webconsole: webconsole:${KUBECUBE_IMAGE_TAG}
+    cloudshell: cloudshell:${KUBECUBE_IMAGE_TAG}
+    frontend: frontend:${KUBECUBE_IMAGE_TAG}
+    dependenceJob: warden-dependence:${KUBECUBE_IMAGE_TAG}
+    ingressController: ingress-nginx-controller:${KUBECUBE_IMAGE_TAG}
+    ingressControllerJob: ingress-nginx-kube-webhook-certgen:${KUBECUBE_IMAGE_TAG}
+    localPathStorageProvisioner: rancher-local-path-provisioner:${KUBECUBE_IMAGE_TAG}
+    cfssl: cfssl:${KUBECUBE_IMAGE_TAG}
+    kubectl: bitnami-kubectl:${KUBECUBE_IMAGE_TAG}
+
+  certs:
+    mode: auto
+
+  hotPlugEnable:
+    pivot:
+      logseer: "disabled"
+      logagent: "disabled"
+      elasticsearch: "disabled"
+      monitoring: "disabled"
+      thanos: "disabled"
+    common:
+      logseer: "disabled"
+      logagent: "disabled"
+      elasticsearch: "disabled"
+      monitoring: "disabled"
+      thanos: "disabled"
+
+  # Only the agent. Everything else in this chart belongs to a pivot, and a
+  # member that renders it installs a second control plane into itself.
+  componentsEnable:
+    kubecube: "false"
+    warden: "true"
+    audit: "false"
+    webconsole: "false"
+    cloudshell: "false"
+    frontend: "false"
+
+  dependencesEnable:
+    ingressController: "false"
+    localPathStorage: "false"
+    metricServer: "false"
+
+  # local: this cluster. pivot: the platform, which the warden uses to report in.
+  localKubeConfig: $(base64 -w 0 < "${MEMBER_KUBECONFIG}")
+  pivotKubeConfig: $(base64 -w 0 < "${PIVOT_KUBECONFIG}")
+
+warden:
+  containers:
+    warden:
+      # The JWT secret is two unlinked keys that have to agree: the pivot's cube
+      # mints tokens with kubecube.env.jwtSecret, and this cluster's warden
+      # validates them with warden.containers.warden.env.JWTSecret. The chart's
+      # defaults happen to be the same literal, so leaving both alone works
+      # until the pivot was installed with something else — and then the only
+      # symptom is that user kubeconfigs stop working, with nothing in the logs
+      # pointing at the secret.
+      env:
+        JWTSecret: "${PIVOT_JWT_SECRET}"
+      args:
+        cluster: "${MEMBER_CLUSTER_NAME}"
+        inMemberCluster: "true"
+        isClusterWritable: "true"
+
+# The other half of that pair, on the component that mints the tokens.
+kubecube:
+  env:
+    jwtSecret: "${PIVOT_JWT_SECRET}"
+EOF
+}
+
+# wait_member_ready reports what is running, so a failure names the component
+# rather than only saying helm gave up.
+function wait_member_ready() {
+  clog info "waiting for the member's warden"
+  local deadline=$((SECONDS + 600))
+  while [ ${SECONDS} -lt ${deadline} ]; do
+    local deploys not_ready
+    deploys=$(KUBECONFIG="${MEMBER_KUBECONFIG}" kubectl -n "${NS}" get deploy --no-headers 2> /dev/null | wc -l)
+    not_ready=$(KUBECONFIG="${MEMBER_KUBECONFIG}" kubectl -n "${NS}" get pods --no-headers 2> /dev/null \
+      | grep -v -e " Running " -e " Completed " | wc -l)
+    if [ "${deploys}" -ge 1 ] && [ "${not_ready}" -eq 0 ]; then
+      KUBECONFIG="${MEMBER_KUBECONFIG}" kubectl -n "${NS}" get deploy
+      KUBECONFIG="${MEMBER_KUBECONFIG}" kubectl -n "${NS}" get pods
+      return 0
+    fi
+    sleep 10
+  done
+
+  clog error "the member's warden did not become ready in 600s"
+  KUBECONFIG="${MEMBER_KUBECONFIG}" kubectl -n "${NS}" get deploy
+  KUBECONFIG="${MEMBER_KUBECONFIG}" kubectl -n "${NS}" get pods
+  KUBECONFIG="${MEMBER_KUBECONFIG}" kubectl -n "${NS}" describe pods | tail -80
+  exit 1
+}
+
+render_values
+
+clog info "deploy the member side as ${MEMBER_CLUSTER_NAME}, registering with ${PIVOT_CUBE_HOST}"
+KUBECONFIG="${MEMBER_KUBECONFIG}" /usr/local/bin/helm upgrade --install kubecube -n "${NS}" --create-namespace \
+  /etc/kubecube/kubecube-chart -f ./member-values.yaml --wait --timeout 15m
+
+# The chart's warden Service is a NodePort whose three ports (31443, 32444,
+# 32445) are hardcoded in the template with no values key. On a host that also
+# runs a pivot those ports already belong to the pivot's warden, and the
+# collision is worse than a failed bind: the platform rewrites every cluster's
+# kubeconfig host from 6443 to 31443, so a user's member kubeconfig can end up
+# talking to the pivot's warden, whose auth proxy forwards to its own cluster.
+#
+# Nothing here needs those ports published. Registration dials out to the pivot,
+# and the member's webhook addresses this Service by its cluster DNS name, so
+# making it ClusterIP removes both the collision and the ambiguity.
+if KUBECONFIG="${MEMBER_KUBECONFIG}" kubectl -n "${NS}" get svc warden > /dev/null 2>&1; then
+  clog info "making the member's warden Service ClusterIP: its NodePorts are hardcoded and would collide with the pivot's"
+  KUBECONFIG="${MEMBER_KUBECONFIG}" kubectl -n "${NS}" patch svc warden --type merge -p '{"spec":{"type":"ClusterIP"}}' > /dev/null
+fi
+
+wait_member_ready
+clog info "member ${MEMBER_CLUSTER_NAME} is up; the pivot should now list it"

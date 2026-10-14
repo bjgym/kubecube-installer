@@ -95,3 +95,15 @@ if [[ ${INSTALL_KUBECUBE_PIVOT} = "true" ]]; then
 helm_download
 /bin/bash /etc/kubecube/manifests/install_kubecube.sh
 fi
+
+# A member is the other half of onboarding: the same chart, with the pivot's own
+# components off, registering itself with a pivot that is already running.
+if [[ ${INSTALL_KUBECUBE_MEMBER} = "true" ]]; then
+  helm_download
+  clog info "installing the member side, registering with ${PIVOT_CUBE_HOST}"
+  /bin/bash /etc/kubecube/manifests/install_member.sh
+  if [ "$?" -ne 0 ]; then
+    clog error "install member side failed"
+    exit 1
+  fi
+fi

@@ -51,6 +51,13 @@ INSTALLER_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=/dev/null
 source <(sed 's/\r$//' "${INSTALLER_DIR}/install.conf")
 
+# The repository's install.conf is the default. These two can still be chosen
+# per bundle from the environment, which is how one build host produces both a
+# k0s bundle and a kubeadm bundle without editing the repository between runs.
+# They are read after the file is sourced, so the environment wins over it.
+KUBERNETES_DISTRO=${BUNDLE_DISTRO:-${KUBERNETES_DISTRO}}
+KUBERNETES_VERSION=${BUNDLE_KUBERNETES_VERSION:-${KUBERNETES_VERSION}}
+
 ARCH=$(case "$(uname -m)" in
   x86_64) echo amd64 ;;
   aarch64 | arm64) echo arm64 ;;
@@ -594,11 +601,36 @@ EOF
 #######################################################################
 OFFLINE="true"
 OFFLINE_BUNDLE_DIR="${OUT}"
-KUBERNETES_DISTRO="k0s"
+KUBERNETES_DISTRO="${KUBERNETES_DISTRO}"
+KUBERNETES_VERSION="${KUBERNETES_VERSION}"
 CNI="${CNI}"
 KUBECUBE_IMAGE_TAG="${IMAGE_TAG}"
 KUBECUBE_IMAGE_REGISTRY="${IMAGE_REGISTRY}"
 KUBECUBE_IMAGE_PROJECT="${IMAGE_PROJECT}"
+
+# The kubeadm path reads its distribution binary, its images and its container
+# runtime from a directory of loose files rather than from the network; the two
+# variables that switch it on were referenced in install_k8s.sh and defined
+# nowhere, which is what made that branch dead code.
+OFFLINE_INSTALL="true"
+OFFLINE_PKG_PATH="${OUT}/offline"
+EOF
+
+  # A minimal bundle carries the distribution's own artefacts only: no platform
+  # images and no chart. Two consequences have to be written down with it, or the
+  # install walks into a wall:
+  #   - the pivot cannot be installed from it (its images are not here), and
+  #   - the kubeadm offline path takes its container runtime from the bundle's
+  #     packages, where docker would need cri-dockerd, which no reachable source
+  #     provides on this network.
+  if [ "${BUNDLE_MINIMAL}" = "true" ]; then
+    cat >> "${OUT}/manifests/install.conf" << EOF
+INSTALL_KUBECUBE_PIVOT="false"
+CONTAINER_RUNTIME="containerd"
+EOF
+  fi
+
+  cat >> "${OUT}/manifests/install.conf" << EOF
 # the arm64 bundle cannot build these two yet; see install.conf
 CLOUDSHELL_ENABLE="false"
 FRONTEND_ENABLE="false"
@@ -620,6 +652,102 @@ EOF
 
 # ------------------------------------------------------------------- main
 
+# ------------------------------------------------- kubeadm offline package
+
+# build_kubeadm_offline writes the directory install_k8s.sh reads when
+# OFFLINE_INSTALL is true.
+#
+# Every name below is that script's contract: it moves or untars each one by
+# name. That path had never been reachable — OFFLINE_INSTALL and OFFLINE_PKG_PATH
+# are referenced in install_k8s.sh and defined nowhere — so the names had never
+# been exercised by anything.
+#
+# Only sources that answer on this network are used: dl.k8s.io for the binaries,
+# the Ubuntu archive for the CNI plugins and the container runtime (GitHub, the
+# distribution host and registry.k8s.io do not), and the calico project's docs
+# host for the CNI manifest.
+function build_kubeadm_offline() {
+  local dir="${OUT}/offline"
+  local release="v${KUBERNETES_VERSION}"
+  local cni_version="v0.8.2"
+  local tmp
+  tmp=$(mktemp -d)
+
+  rm -rf "${dir}"
+  mkdir -p "${dir}"
+
+  log "kubeadm offline package for kubernetes ${KUBERNETES_VERSION} (${ARCH})"
+
+  # 1. the three binaries
+  local b
+  for b in kubeadm kubelet kubectl; do
+    fetch "https://dl.k8s.io/release/${release}/bin/linux/${ARCH}/${b}" -o "${dir}/${b}"
+    chmod 0755 "${dir}/${b}"
+  done
+
+  # 2. the kubelet units. Their usual source is raw.githubusercontent, which is
+  # blocked here, so the repository carries them.
+  cp -a "${INSTALLER_DIR}/kubeadm/kubelet.service" "${dir}/kubelet.service"
+  cp -a "${INSTALLER_DIR}/kubeadm/10-kubeadm.conf" "${dir}/10-kubeadm.conf"
+
+  # 3. the CNI plugins, out of the Ubuntu package that carries them: GitHub,
+  # where they are normally published, is not reachable.
+  (cd "${tmp}" && apt-get download containernetworking-plugins > /dev/null 2>&1) \
+    || die "could not download containernetworking-plugins, the only reachable source of the CNI plugins"
+  dpkg-deb -x "${tmp}"/containernetworking-plugins_*.deb "${tmp}/cni"
+  [ -d "${tmp}/cni/opt/cni/bin" ] || die "the CNI plugin package did not contain /opt/cni/bin"
+  tar -czf "${dir}/cni-plugins-linux-${ARCH}-${cni_version}.tgz" -C "${tmp}/cni/opt/cni/bin" .
+  rm -rf "${tmp}/cni"
+
+  # 4. the container runtime, as packages rather than the tarball the online path
+  # downloads from the distribution host. containerd brings its own dependencies
+  # this way; downloading the one package by hand would miss runc.
+  (cd "${dir}" && apt-get install -y --download-only -o Dir::Cache::archives="${dir}" containerd > /dev/null 2>&1) \
+    || die "could not download containerd and its dependencies"
+  ls "${dir}"/containerd_*.deb > /dev/null 2>&1 || die "no containerd package landed in ${dir}"
+
+  # 5. the CNI manifest, and a check that the images it names are the ones this
+  # bundle carries. install_k8s.sh applies manifests/cni/<cni>/v<version>, so it
+  # has to live in the bundle's manifests tree.
+  fetch -L "https://docs.tigera.io/calico/latest/manifests/calico.yaml" -o "${dir}/calico.yaml"
+  mkdir -p "${OUT}/manifests/cni/calico/${release}"
+  cp -a "${dir}/calico.yaml" "${OUT}/manifests/cni/calico/${release}/calico.yaml"
+
+  # 6. the images: the ones images/k8s/<version>/images.list names, which the
+  # manifest above has to agree with — a manifest naming an image the bundle
+  # does not carry is a cluster whose CNI never starts.
+  local images=()
+  local image
+  while read -r image; do
+    [ -n "${image}" ] || continue
+    images+=("${image}")
+  done < <(sed -e 's/#.*$//' -e '/^[[:space:]]*$/d' "${INSTALLER_DIR}/images/k8s/v${KUBERNETES_VERSION}/images.list")
+
+  local from_manifest
+  from_manifest=$(grep -oE 'image: *"?[^"[:space:]]+"?' "${dir}/calico.yaml" \
+    | sed -E 's/image: *"?([^"]+)"?/\1/' | sort -u)
+  local missing=0
+  for image in ${from_manifest}; do
+    case " ${images[*]} " in
+      *" ${image} "*) ;;
+      *) warn "the calico manifest names ${image}, which images.list does not"; missing=$((missing + 1)) ;;
+    esac
+  done
+  if [ "${missing}" -gt 0 ]; then
+    die "the calico manifest and images/k8s/v${KUBERNETES_VERSION}/images.list disagree"
+  fi
+
+  for image in "${images[@]}"; do
+    pull_with_fallback "${image}" \
+      "$(echo "${image}" | sed -e 's#^docker\.io/#docker.1ms.run/#' -e 's#^registry\.k8s\.io/#registry.cn-hangzhou.aliyuncs.com/google_containers/#')" \
+      "${image}"
+  done
+
+  save_archive "${dir}/offline_images.tar" "${images[@]}"
+
+  log "kubeadm offline package: $(du -sh "${dir}" | awk '{print $1}')"
+}
+
 function Main() {
   preflight
 
@@ -627,7 +755,7 @@ function Main() {
   mkdir -p "${OUT}"/{manifests,charts,k0s,images,bin}
 
   # the installer scripts travel in the bundle: the target machine has no copy
-  for f in entry.sh install.sh install_k8s.sh install_k0s.sh install_kubecube.sh utils.sh cleanup.sh; do
+  for f in entry.sh install.sh install_k8s.sh install_k0s.sh install_kubecube.sh install_member.sh utils.sh cleanup.sh; do
     if [ -f "${INSTALLER_DIR}/${f}" ]; then
       cp -a "${INSTALLER_DIR}/${f}" "${OUT}/manifests/"
     else
@@ -643,13 +771,26 @@ function Main() {
     die "entry.sh is missing from ${INSTALLER_DIR}"
   fi
 
-  build_k0s
-  build_charts
+  # BUNDLE_MINIMAL builds a bundle for a cluster only: the distribution's own
+  # artefacts, no platform images and no charts. It exists so a kubeadm bundle
+  # can be produced on a host that does not have the component sources: the
+  # platform images are the same images under the same tag as the k0s bundle's,
+  # so a member install takes them from there.
+  if [ "${BUNDLE_MINIMAL}" != "true" ]; then
+    build_k0s
+    build_charts
+    build_platform_images
+    build_cilium_images
+    build_k0s_component_images
+  fi
   build_binaries
-  build_platform_images
-  build_cilium_images
-  build_k0s_component_images
-  save_images
+  if [ "${KUBERNETES_DISTRO}" = "kubeadm" ]; then
+    build_kubeadm_offline
+  fi
+  # a minimal bundle carries the kubeadm images inside offline/ instead
+  if [ "${BUNDLE_MINIMAL}" != "true" ]; then
+    save_images
+  fi
   # the normalised hotplugs copy is a build input, not part of the bundle
   rm -rf "${OUT}/.hotplugs-build"
   write_bundle_files

@@ -67,6 +67,24 @@ Two versions move together: Cilium 1.16 is the last Cilium line that supports
 Kubernetes 1.28, and k0s 1.28 is the last k0s line whose control-plane taint key
 is still `master`. Raise Kubernetes and Cilium together, never alone.
 
+### Joining a cluster to a pivot
+
+`INSTALL_KUBECUBE_PIVOT="true"` installs a pivot. A cluster that should be
+*managed* by one installs the member side instead:
+
+```bash
+INSTALL_KUBECUBE_MEMBER="true"
+PIVOT_CUBE_HOST="<pivotIP>:30443"
+PIVOT_KUBECONFIG="/root/.kube/config"          # a kubeconfig for the pivot
+MEMBER_KUBECONFIG="/etc/kubernetes/admin.conf" # this cluster's kubeconfig
+MEMBER_CLUSTER_NAME=""                         # empty means the hostname
+```
+
+It renders the same chart with `componentsEnable.kubecube="false"`, which is what
+makes it a member: the warden dials the pivot instead of an in-cluster service,
+and registers itself (`wardenRegisterModeEnable` is on by default), so nothing is
+pushed into the member from the pivot.
+
 ## Clean UP
 
 ```bash

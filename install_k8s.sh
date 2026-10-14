@@ -245,6 +245,24 @@ function containerd_installed(){
     return
   fi
 
+  if [[ "$OFFLINE_INSTALL" == "true" ]]; then
+    # The online path untars a containerd release tarball from the distribution
+    # host. Offline the bundle carries packages instead, which is also the only
+    # way to get runc and the rest of containerd's dependencies with it: the
+    # release tarball has no runc in it.
+    clog info "installing containerd from the bundle's packages"
+    if ! dpkg -i "${OFFLINE_PKG_PATH}"/*.deb; then
+      clog error "installing the bundled container runtime packages failed"
+      exit 1
+    fi
+    if ! command -v ctr >/dev/null 2>&1; then
+      clog error "ctr is still missing after installing the bundled packages"
+      exit 1
+    fi
+    clog info "install containerd success"
+    return
+  fi
+
   os_arch="amd64"
   if [[ $(arch) == aarch64 ]]; then
     os_arch="arm64"
@@ -321,9 +339,15 @@ function k8s_bin_get() {
     k8s_bin_local
   else
     k8s_bin_download
-      if [[ ${CONTAINER_RUNTIME} = "containerd" ]]; then
-        sed -i '2a\Environment="KUBELET_EXTRA_ARGS=--runtime-cgroups=/system.slice/containerd.service --container-runtime=remote --runtime-request-timeout=15m --container-runtime-endpoint=unix:///run/containerd/containerd.sock"' /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
-      fi
+  fi
+
+  # The kubelet needs to be told which CRI endpoint to use. With containerd that
+  # has to be explicit: the dockershim it would otherwise fall back to was
+  # removed in 1.24, so a kubelet without this line never registers a node. It
+  # used to be written only on the download path, which left the offline path
+  # with a kubelet that could not start at all.
+  if [[ ${CONTAINER_RUNTIME} = "containerd" ]]; then
+    sed -i '2a\Environment="KUBELET_EXTRA_ARGS=--runtime-cgroups=/system.slice/containerd.service --container-runtime=remote --runtime-request-timeout=15m --container-runtime-endpoint=unix:///run/containerd/containerd.sock"' /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
   fi
 }
 
@@ -333,14 +357,25 @@ function k8s_bin_local() {
   clog debug "get cni plugin"
   tar -zxvf ${OFFLINE_PKG_PATH}/cni-plugins-linux-${os_arch}-${CNI_VERSION}.tgz -C /opt/cni/bin > /dev/null
 
-  clog debug "get crictl"
-  tar -zxvf ${OFFLINE_PKG_PATH}/crictl-${CRICTL_VERSION}-linux-${os_arch}.tar.gz -C $DOWNLOAD_DIR > /dev/null
+  # crictl is what the *online* path pulls images with. Offline the images come
+  # from the bundle, so it is optional here: it is not in the Ubuntu archive and
+  # its only other source is GitHub, which is exactly what an offline machine
+  # cannot reach.
+  if [ -f "${OFFLINE_PKG_PATH}/crictl-${CRICTL_VERSION}-linux-${os_arch}.tar.gz" ]; then
+    clog debug "get crictl"
+    tar -zxvf ${OFFLINE_PKG_PATH}/crictl-${CRICTL_VERSION}-linux-${os_arch}.tar.gz -C $DOWNLOAD_DIR > /dev/null
+  else
+    clog warn "no crictl in the offline package; it is only used to pull images, which offline comes from the bundle"
+  fi
 
   clog debug "get kubeadm,kubelet,kubectl"
   mv ${OFFLINE_PKG_PATH}/kubeadm $DOWNLOAD_DIR
   mv ${OFFLINE_PKG_PATH}/kubelet $DOWNLOAD_DIR
   mv ${OFFLINE_PKG_PATH}/kubectl $DOWNLOAD_DIR
-  chmod +x {$DOWNLOAD_DIR/kubeadm,$DOWNLOAD_DIR/kubelet,$DOWNLOAD_DIR/kubectl}
+  # One path per argument. The brace form "{a,b,c}" is not expansion, it is a
+  # single word with braces in it, so the old chmod matched nothing and left the
+  # three binaries without the execute bit.
+  chmod +x "${DOWNLOAD_DIR}/kubeadm" "${DOWNLOAD_DIR}/kubelet" "${DOWNLOAD_DIR}/kubectl"
 
   clog debug "config for kubelet service"
   cat ${OFFLINE_PKG_PATH}/kubelet.service | sed "s:/usr/bin:${DOWNLOAD_DIR}:g" | tee /etc/systemd/system/kubelet.service
@@ -416,7 +451,15 @@ function cri_dockerd_install() {
 function images_download() {
   if [[ "$OFFLINE_INSTALL" == "true" ]]; then
       clog info "loading image form local"
-      docker load < ${OFFLINE_PKG_PATH}/offline_images.tar
+      if [[ ${CONTAINER_RUNTIME} = "containerd" ]]; then
+        # Same archive, same importer as the k0s path. The bundle normalises it
+        # first: docker save writes an archive whose OCI index names platforms
+        # the archive does not carry, and containerd follows that index and
+        # fails with "content digest ...: not found".
+        ctr -n k8s.io images import "${OFFLINE_PKG_PATH}/offline_images.tar"
+      else
+        docker load < ${OFFLINE_PKG_PATH}/offline_images.tar
+      fi
   else
       clog info "downloading images"
 

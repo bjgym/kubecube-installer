@@ -1,0 +1,25 @@
+# Kubernetes 1.28.15 images for the kubeadm path.
+#
+# Same shape and the same registry choices as the other versions here: the
+# control-plane images come from the aliyun mirror of registry.k8s.io, which is
+# reachable from networks where registry.k8s.io is not.
+#
+# The calico images are the upstream ones rather than a re-hosted copy: the
+# project's own `kubecube/calico-*:vX-m` tags exist for the versions it has
+# repackaged, and 1.28 is not one of them. The manifest that goes with this file
+# (cni/calico/v1.28.15/calico.yaml) has to name the same images.
+#
+# Versions are what kubeadm 1.28.15 itself defaults to: etcd 3.5.9-0, coredns
+# v1.10.1, pause 3.9.
+
+registry.cn-hangzhou.aliyuncs.com/google_containers/kube-apiserver:v1.28.15
+registry.cn-hangzhou.aliyuncs.com/google_containers/kube-controller-manager:v1.28.15
+registry.cn-hangzhou.aliyuncs.com/google_containers/kube-scheduler:v1.28.15
+registry.cn-hangzhou.aliyuncs.com/google_containers/kube-proxy:v1.28.15
+registry.cn-hangzhou.aliyuncs.com/google_containers/pause:3.9
+registry.cn-hangzhou.aliyuncs.com/google_containers/etcd:3.5.9-0
+registry.cn-hangzhou.aliyuncs.com/google_containers/coredns:v1.10.1
+
+docker.io/calico/node:v3.26.4
+docker.io/calico/cni:v3.26.4
+docker.io/calico/kube-controllers:v3.26.4

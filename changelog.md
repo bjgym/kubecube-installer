@@ -1,6 +1,11 @@
 # v1.4.0
 
 ## Feature
+- install the member side of onboarding: `INSTALL_KUBECUBE_MEMBER="true"` renders
+  the same chart with the pivot's own components off and the warden pointing at
+  `PIVOT_CUBE_HOST`, so a cluster joins a pivot that is already running. The
+  installer had no member path at all before — `install.sh` only ever installed a
+  pivot — which left the other half of onboarding to hand-written helm values
 - install k0s as well as kubeadm. `KUBERNETES_DISTRO` picks the provider; the
   k0s provider installs a single-node control plane from the bundled binary,
   renders `network.provider` for kuberouter, calico or cilium, and leaves a
