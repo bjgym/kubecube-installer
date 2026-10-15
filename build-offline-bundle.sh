@@ -126,7 +126,54 @@ function preflight() {
 # some networks, and without a floor a connection that stops moving leaves the
 # build hanging with no output instead of failing.
 function fetch() {
-  curl -sSLf --retry 5 --retry-delay 5 --retry-all-errors --speed-limit 1024 --speed-time 60 "$@"
+  # Two things this network taught this function.
+  #
+  # A single connection to the Kubernetes release bucket runs at tens of KB/s,
+  # while the same host over eight connections runs at several MB/s: the
+  # bottleneck is the connection, not the server. aria2c is used when it is
+  # installed, and curl remains the fallback.
+  #
+  # And a file that is already there is not fetched again, so a build that was
+  # interrupted resumes instead of starting its downloads from zero. That matters
+  # most for the three kubeadm binaries, which are the largest things fetched
+  # here.
+  local out="" url="" a
+  while [ $# -gt 0 ]; do
+    a="$1"
+    shift
+    case "${a}" in
+      -o)
+        out="$1"
+        shift
+        ;;
+      -L | -s | -S | -f) ;;
+      *) url="${a}" ;;
+    esac
+  done
+
+  if [ -n "${out}" ] && [ -s "${out}" ]; then
+    log "have $(basename "${out}"), not fetching it again"
+    return 0
+  fi
+
+  if command -v aria2c > /dev/null 2>&1; then
+    # aria2c's -o is relative to --dir and it drops a leading slash, so an
+    # absolute destination has to be split into the two arguments it understands.
+    # Passing -o /tmp/x/helm.tgz made aria2 write to $PWD/tmp/x/helm.tgz, and the
+    # tar that follows failed on a file that was never where it was asked for.
+    if [ -n "${out}" ]; then
+      aria2c -x8 -s8 -k1M --file-allocation=none --summary-interval=0 \
+        --allow-overwrite=true --retry-wait=5 -m 5 \
+        --dir "$(dirname "${out}")" -o "$(basename "${out}")" "${url}"
+    else
+      aria2c -x8 -s8 -k1M --file-allocation=none --summary-interval=0 \
+        --allow-overwrite=true --retry-wait=5 -m 5 "${url}"
+    fi
+    return $?
+  fi
+
+  curl -sSLf --retry 5 --retry-delay 5 --retry-all-errors --speed-limit 1024 --speed-time 60 \
+    ${out:+-o "${out}"} "${url}"
 }
 
 # pull_with_fallback pulls an image trying each source in turn, and retags it to
@@ -630,6 +677,16 @@ CONTAINER_RUNTIME="containerd"
 EOF
   fi
 
+  # The kubeadm path installs calico and only calico: it applies
+  # manifests/cni/<cni>/v<version> and the offline package fetches the calico
+  # manifest. Writing the repository default (cilium) into a kubeadm bundle sends
+  # the install looking for a manifest the bundle does not carry.
+  if [ "${KUBERNETES_DISTRO}" = "kubeadm" ]; then
+    cat >> "${OUT}/manifests/install.conf" << EOF
+CNI="calico"
+EOF
+  fi
+
   cat >> "${OUT}/manifests/install.conf" << EOF
 # the arm64 bundle cannot build these two yet; see install.conf
 CLOUDSHELL_ENABLE="false"
@@ -673,15 +730,40 @@ function build_kubeadm_offline() {
   local tmp
   tmp=$(mktemp -d)
 
-  rm -rf "${dir}"
+  # Deliberately not cleaned first: fetch skips files that are already there, so
+  # an interrupted build picks up where it stopped instead of re-downloading the
+  # three binaries, which are the largest things this function fetches.
   mkdir -p "${dir}"
 
   log "kubeadm offline package for kubernetes ${KUBERNETES_VERSION} (${ARCH})"
 
-  # 1. the three binaries
-  local b
+  # 1. the three binaries, each checked against the checksum the release bucket
+  # publishes beside it.
+  #
+  # The check is not decoration: these are the largest downloads here, a fetch
+  # that fails leaves a truncated file behind, and a truncated kubelet produces a
+  # bundle that installs a cluster that will not come up — a failure that would
+  # otherwise only appear at the far end of an acceptance run. The .sha256 files
+  # hold the bare hash with no filename, so sha256sum -c cannot read them; the two
+  # hashes are compared directly.
+  local b want got
   for b in kubeadm kubelet kubectl; do
-    fetch "https://dl.k8s.io/release/${release}/bin/linux/${ARCH}/${b}" -o "${dir}/${b}"
+    fetch "https://dl.k8s.io/release/${release}/bin/linux/${ARCH}/${b}" -o "${dir}/${b}" \
+      || die "could not fetch ${b}"
+    # curl rather than fetch: this one has to arrive on stdout, and fetch without
+    # an output file hands the download to aria2, which writes a file named after
+    # the URL instead of printing it.
+    want=$(curl -sSLf "https://dl.k8s.io/release/${release}/bin/linux/${ARCH}/${b}.sha256" \
+      | tr -d '[:space:]' | cut -c1-64)
+    got=$(sha256sum "${dir}/${b}" | cut -d' ' -f1)
+    if [ -z "${want}" ] || [ "${want}" != "${got}" ]; then
+      # Removed before failing: fetch skips a file that is already there, so
+      # leaving a truncated one behind would make every later run reuse it and
+      # fail the same way, with no way back except deleting it by hand.
+      rm -f "${dir}/${b}" "${dir}/${b}.aria2"
+      die "${b} does not match its published checksum (want ${want:-none}, got ${got})"
+    fi
+    log "${b} verified: ${got}"
     chmod 0755 "${dir}/${b}"
   done
 
@@ -695,23 +777,70 @@ function build_kubeadm_offline() {
   (cd "${tmp}" && apt-get download containernetworking-plugins > /dev/null 2>&1) \
     || die "could not download containernetworking-plugins, the only reachable source of the CNI plugins"
   dpkg-deb -x "${tmp}"/containernetworking-plugins_*.deb "${tmp}/cni"
-  [ -d "${tmp}/cni/opt/cni/bin" ] || die "the CNI plugin package did not contain /opt/cni/bin"
-  tar -czf "${dir}/cni-plugins-linux-${ARCH}-${cni_version}.tgz" -C "${tmp}/cni/opt/cni/bin" .
+
+  # Ubuntu 24.04 ships these under /usr/lib/cni and older releases shipped them
+  # under /opt/cni/bin, so take whichever this release has rather than assuming
+  # one: assuming /opt/cni/bin is what failed this step on every attempt. The
+  # tarball lays them out flat either way, because install_k8s.sh extracts it
+  # into /opt/cni/bin on the target.
+  local cni_bin=""
+  local candidate
+  for candidate in "${tmp}/cni/opt/cni/bin" "${tmp}/cni/usr/lib/cni"; do
+    if [ -d "${candidate}" ]; then
+      cni_bin="${candidate}"
+      break
+    fi
+  done
+  [ -n "${cni_bin}" ] || die "the CNI plugin package carried no CNI plugin directory"
+  log "CNI plugins from ${cni_bin#"${tmp}/cni"}"
+  tar -czf "${dir}/cni-plugins-linux-${ARCH}-${cni_version}.tgz" -C "${cni_bin}" .
   rm -rf "${tmp}/cni"
 
   # 4. the container runtime, as packages rather than the tarball the online path
   # downloads from the distribution host. containerd brings its own dependencies
   # this way; downloading the one package by hand would miss runc.
-  (cd "${dir}" && apt-get install -y --download-only -o Dir::Cache::archives="${dir}" containerd > /dev/null 2>&1) \
+  #
+  # --reinstall is what makes this work on a build host that already has
+  # containerd — docker.io pulls it in — because apt otherwise reports "already
+  # the newest version" and downloads nothing, leaving the check below to fail.
+  (cd "${dir}" && apt-get install -y --reinstall --download-only -o Dir::Cache::archives="${dir}" containerd > /dev/null 2>&1) \
     || die "could not download containerd and its dependencies"
   ls "${dir}"/containerd_*.deb > /dev/null 2>&1 || die "no containerd package landed in ${dir}"
 
   # 5. the CNI manifest, and a check that the images it names are the ones this
   # bundle carries. install_k8s.sh applies manifests/cni/<cni>/v<version>, so it
   # has to live in the bundle's manifests tree.
-  fetch -L "https://docs.tigera.io/calico/latest/manifests/calico.yaml" -o "${dir}/calico.yaml"
+  #
+  # The calico version comes from images.list rather than from "latest". Two
+  # things make "latest" wrong here: docs.tigera.io redirects to
+  # raw.githubusercontent, which is blocked on this network, and its latest is a
+  # different calico release from the images this bundle stages, so the
+  # cross-check below would fail on the mismatch it exists to catch. The mirrors
+  # are tried in turn; the first two are reachable where GitHub is not.
+  local calico_version
+  calico_version=$(grep -oE 'calico/node:v[0-9.]+' "${INSTALLER_DIR}/images/k8s/v${KUBERNETES_VERSION}/images.list" \
+    | head -1 | sed 's#.*:##')
+  [ -n "${calico_version}" ] || die "images/k8s/v${KUBERNETES_VERSION}/images.list names no calico/node image to take a version from"
+  log "calico manifest for ${calico_version}"
+
+  local calico_manifest="${dir}/calico.yaml"
+  local calico_src
+  for calico_src in \
+    "https://gitee.com/mirrors/calico/raw/${calico_version}/manifests/calico.yaml" \
+    "https://gh-proxy.com/https://raw.githubusercontent.com/projectcalico/calico/${calico_version}/manifests/calico.yaml" \
+    "https://ghfast.top/https://raw.githubusercontent.com/projectcalico/calico/${calico_version}/manifests/calico.yaml"; do
+    # curl rather than fetch: fetch hands the download to aria2, which reported
+    # zero bytes on the redirecting URL and left an empty file behind.
+    if curl -sSLf -m 120 -o "${calico_manifest}" "${calico_src}"; then
+      log "calico manifest from ${calico_src%%/manifests*}"
+      break
+    fi
+    warn "${calico_src} did not work"
+  done
+  [ -s "${calico_manifest}" ] || die "could not fetch the calico manifest for ${calico_version}"
+
   mkdir -p "${OUT}/manifests/cni/calico/${release}"
-  cp -a "${dir}/calico.yaml" "${OUT}/manifests/cni/calico/${release}/calico.yaml"
+  cp -a "${calico_manifest}" "${OUT}/manifests/cni/calico/${release}/calico.yaml"
 
   # 6. the images: the ones images/k8s/<version>/images.list names, which the
   # manifest above has to agree with — a manifest naming an image the bundle
@@ -751,7 +880,12 @@ function build_kubeadm_offline() {
 function Main() {
   preflight
 
-  rm -rf "${OUT}"
+  # offline/ is deliberately kept. It holds the three Kubernetes binaries, the
+  # largest downloads in a kubeadm bundle, and fetch skips a file that is already
+  # there. Wiping the whole bundle made every retry re-download 200MB, which is
+  # how one failing step turned into four attempts. Everything else is rebuilt
+  # from scratch, so nothing stale can reach the manifest.
+  rm -rf "${OUT}/bin" "${OUT}/charts" "${OUT}/k0s" "${OUT}/images" "${OUT}/manifests"
   mkdir -p "${OUT}"/{manifests,charts,k0s,images,bin}
 
   # the installer scripts travel in the bundle: the target machine has no copy

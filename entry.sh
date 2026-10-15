@@ -34,6 +34,14 @@ function env_check() {
     if [ "${distro}" = "k0s" ]; then
       need_full=false
     fi
+    # A single-node offline install needs none of the full set either: sshpass
+    # joins nodes and this installs one, unzip unpacks downloads and nothing is
+    # downloaded, and kube-proxy uses conntrack's kernel side rather than the
+    # tool. A fresh Ubuntu has none of the three, so demanding them rejects a
+    # host that can run the install perfectly well.
+    if [ "${OFFLINE}" = "true" ] && [ "${NODE_MODE}" = "master" ]; then
+      need_full=false
+    fi
 
     echo -e "$(date +'%Y-%m-%d %H:%M:%S') \033[32mINFO\033[0m environment checking (${distro})"
 
@@ -106,14 +114,27 @@ function bundle_stage() {
     echo -e "$(date +'%Y-%m-%d %H:%M:%S') \033[31mERROR\033[0m the bundle has no manifests directory"
     exit 1
   fi
-  if [ ! -d "${ENTRY_DIR}/charts/kubecube-chart" ]; then
-    echo -e "$(date +'%Y-%m-%d %H:%M:%S') \033[31mERROR\033[0m the bundle has no charts/kubecube-chart"
-    exit 1
-  fi
 
-  rm -rf "${MANIFEST_BASE}/manifests" "${MANIFEST_BASE}/kubecube-chart"
+  rm -rf "${MANIFEST_BASE}/manifests"
   cp -a "${ENTRY_DIR}/manifests" "${MANIFEST_BASE}/manifests"
-  cp -a "${ENTRY_DIR}/charts/kubecube-chart" "${MANIFEST_BASE}/kubecube-chart"
+
+  # The chart is only needed when this bundle installs the platform. A minimal
+  # bundle carries the distribution's artefacts alone — a cluster and nothing
+  # else — so demanding a chart it does not have would stop it before it starts.
+  # The last assignment wins in install.conf, which is why this reads the file
+  # rather than the environment.
+  local install_pivot
+  install_pivot=$(grep -E '^INSTALL_KUBECUBE_PIVOT=' "${MANIFEST_BASE}/manifests/install.conf" | tail -1 | cut -d'"' -f2)
+  if [ "${install_pivot}" = "true" ]; then
+    if [ ! -d "${ENTRY_DIR}/charts/kubecube-chart" ]; then
+      echo -e "$(date +'%Y-%m-%d %H:%M:%S') \033[31mERROR\033[0m this bundle installs the platform but has no charts/kubecube-chart"
+      exit 1
+    fi
+    rm -rf "${MANIFEST_BASE}/kubecube-chart"
+    cp -a "${ENTRY_DIR}/charts/kubecube-chart" "${MANIFEST_BASE}/kubecube-chart"
+  else
+    clog_info "this bundle installs a cluster only; there is no chart to stage"
+  fi
 
   # helm and kubectl come from the bundle: the online path downloads helm and
   # the kubeadm path installs kubectl, and neither happens offline.
