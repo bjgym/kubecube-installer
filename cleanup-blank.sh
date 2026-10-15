@@ -138,6 +138,22 @@ function stop_kubeadm() {
     warn "would stop kubelet"
   fi
 
+  # Static pods are held by containerd's shims, and purging containerd does not
+  # stop the processes those shims are running: the API server from the previous
+  # run stays on 6443 and the next "kubeadm init" refuses with "Port 6443 is in
+  # use". So the control plane is stopped and anything left over is killed.
+  if [ "${DO_IT}" = "true" ]; then
+    systemctl stop containerd > /dev/null 2>&1 || true
+    local proc
+    for proc in kube-apiserver kube-controller-manager kube-scheduler etcd; do
+      if pkill -f "${proc}" > /dev/null 2>&1; then
+        log "stopped leftover ${proc}"
+      fi
+    done
+  else
+    warn "would stop containerd and any leftover control plane process"
+  fi
+
   remove /etc/kubernetes
   remove /var/lib/kubelet
   remove /var/lib/etcd
@@ -301,9 +317,19 @@ function remove_cni_leftovers() {
   for chain in CILIUM_FORWARD CILIUM_INPUT CILIUM_OUTPUT CILIUM_POSTROUTING CILIUM_PRE_mangle CILIUM_POST_mangle; do
     if iptables -L "${chain}" > /dev/null 2>&1; then
       if [ "${DO_IT}" = "true" ]; then
+        # The jump rules come out first: a chain that is still referenced cannot
+        # be deleted, and the reference is what keeps cilium's view of the world
+        # in the packet path of the next cluster.
+        local table parent
+        for table in filter nat mangle; do
+          for parent in INPUT OUTPUT FORWARD PREROUTING POSTROUTING; do
+            while iptables -t "${table}" -D "${parent}" -j "${chain}" > /dev/null 2>&1; do :; done
+            while iptables -t "${table}" -D "${parent}" -m comment --comment "cilium-feeder: ${chain}" -j "${chain}" > /dev/null 2>&1; do :; done
+          done
+        done
         iptables -F "${chain}" > /dev/null 2>&1 || true
         iptables -X "${chain}" > /dev/null 2>&1 || true
-        log "removed iptables chain ${chain}"
+        log "removed iptables chain ${chain} and its jump rules"
       else
         warn "would remove iptables chain ${chain}"
       fi

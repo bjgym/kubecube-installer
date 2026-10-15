@@ -362,6 +362,30 @@ EOF
 EOF
     fi
 
+    # containerd 2.x reads the sandbox image from
+    # [plugins.'io.containerd.cri.v1.images'.pinned_images] sandbox = ... and
+    # ignores sandbox_image, which is the key 1.x uses. Writing only
+    # sandbox_image looked right in the file and changed nothing: the kubelet kept
+    # asking for registry.k8s.io/pause:3.10.1, containerd's own default, which an
+    # offline machine cannot pull, and every pod failed with CreatePodSandbox.
+    # Both keys are written, because containerd accepts and ignores the one it
+    # does not use.
+    if grep -qE "^[[:space:]]*\[plugins\.[^]]*pinned_images\]" /etc/containerd/config.toml; then
+      if grep -qE "^[[:space:]]*sandbox[[:space:]]*=" /etc/containerd/config.toml; then
+        sed -i -E "s|^[[:space:]]*sandbox[[:space:]]*=.*|      sandbox = \"${sandbox}\"|" /etc/containerd/config.toml
+      else
+        awk -v img="${sandbox}" '
+          { print }
+          !done && /^[[:space:]]*\[plugins\.[^]]*pinned_images\]/ {
+            match($0, /^[[:space:]]*/)
+            print substr($0, 1, RLENGTH) "  sandbox = \"" img "\""
+            done = 1
+          }
+        ' /etc/containerd/config.toml > /etc/containerd/config.toml.new
+        mv /etc/containerd/config.toml.new /etc/containerd/config.toml
+      fi
+    fi
+
     if grep -qE "sandbox_image = \"${pause_registry}/pause:" /etc/containerd/config.toml; then
       clog debug "containerd sandbox_image: $(grep sandbox_image /etc/containerd/config.toml | head -1 | tr -s ' ')"
       clog debug "containerd cri table: ${cri_table:-appended io.containerd.cri.v1.images}"
@@ -377,7 +401,20 @@ EOF
     # verified and then ignored.
     systemctl restart containerd
     systemctl is-active --quiet containerd \
-      || { clog error "containerd did not come back after the sandbox_image change"; exit 1; }
+      || { clog error "containerd did not come back after the sandbox image change"; exit 1; }
+
+    # What the file says is not the evidence: "containerd config dump" prints the
+    # value in force, and on 2.x that is pinned_images.sandbox. Reading the file is
+    # what let a correct-looking sandbox_image sit there while the kubelet kept
+    # asking for a different image.
+    local in_force
+    in_force=$(containerd config dump 2> /dev/null | grep -E "^[[:space:]]*sandbox(_image)?[[:space:]]*=" | tr -s ' ' | tr '\n' ' ')
+    if echo "${in_force}" | grep -qE "${pause_registry}/pause:"; then
+      clog debug "containerd sandbox image in force: ${in_force}"
+    else
+      clog error "containerd is not using the sandbox image this bundle carries; in force: ${in_force:-none}"
+      exit 1
+    fi
   elif [[ "$ZONE" == cn ]];then
     sed -i 's|k8s.gcr.io/pause|registry.cn-hangzhou.aliyuncs.com/k8sxio/pause|' /etc/containerd/config.toml
     ctr -n k8s.io i pull registry.cn-hangzhou.aliyuncs.com/k8sxio/pause:3.5 || true
@@ -590,8 +627,61 @@ function images_download() {
   fi
 }
 
+# k8s_prepare_host_network lets pod traffic through a host firewall.
+#
+# Ubuntu with ufw enabled — which is the default on a fresh 24.04 — sets the INPUT
+# and FORWARD policies to DROP ("deny (incoming), deny (routed)"), and Kubernetes
+# needs both paths: pod to a service on this node is INPUT, pod to anywhere else
+# is FORWARD. The cluster then looks healthy — control plane up, node registered —
+# and every pod fails with "connect: operation not permitted". The first thing to
+# notice here was calico's own install-cni, whose token request to the API server
+# goes through the service ClusterIP.
+#
+# The k0s path learned this already; these are the same rules for kubeadm, with
+# the service CIDR added because a pod reaches the API server through its
+# ClusterIP rather than the node address. Two pod CIDRs are allowed because the
+# CNI decides that: calico's upstream manifest defaults to 192.168.0.0/16 and k0s
+# configures 10.244.0.0/16.
+function k8s_prepare_host_network() {
+  local pod_cidrs="10.244.0.0/16 192.168.0.0/16"
+  local service_cidr="10.96.0.0/12"
+  local pod_cidr
+  local forward_policy
+  forward_policy=$(iptables -S FORWARD | head -1)
+
+  if [ "${forward_policy}" != "-P ACCEPT" ] \
+    || iptables -S FORWARD | grep -q "ufw-before-forward"; then
+    clog warn "a host firewall is dropping pod traffic (FORWARD: ${forward_policy#-P }); allowing pod and service traffic through"
+    iptables -P FORWARD ACCEPT
+    iptables -I FORWARD 1 -s "${service_cidr}" -j ACCEPT
+    for pod_cidr in ${pod_cidrs}; do
+      iptables -I INPUT 1 -s "${pod_cidr}" -j ACCEPT
+      iptables -I FORWARD 1 -s "${pod_cidr}" -j ACCEPT
+    done
+
+    # The rules are lost when the firewall reloads, so they are re-applied every
+    # time the kubelet starts — the one service every node runs.
+    mkdir -p /etc/systemd/system/kubelet.service.d
+    {
+      echo '[Service]'
+      echo '# Pod traffic has to reach services on this node (INPUT) and leave it'
+      echo '# (FORWARD). ufw drops both, and these rules do not survive a reload.'
+      echo 'ExecStartPost=/sbin/iptables -P FORWARD ACCEPT'
+      echo "ExecStartPost=/sbin/iptables -I FORWARD 1 -s ${service_cidr} -j ACCEPT"
+      for pod_cidr in ${pod_cidrs}; do
+        echo "ExecStartPost=/sbin/iptables -I INPUT 1 -s ${pod_cidr} -j ACCEPT"
+        echo "ExecStartPost=/sbin/iptables -I FORWARD 1 -s ${pod_cidr} -j ACCEPT"
+      done
+    } > /etc/systemd/system/kubelet.service.d/forward.conf
+    systemctl daemon-reload
+    clog info "pod traffic allowed; rules re-applied when the kubelet starts"
+  fi
+}
+
 function preparation() {
   clog info "doing previous preparation"
+
+  k8s_prepare_host_network
 
   clog debug "closing swap"
   swapoff -a
