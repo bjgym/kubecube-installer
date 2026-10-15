@@ -308,11 +308,76 @@ EOF
   #
   # Offline the pause image is already in the bundle, under the name images.list
   # gives it, so the config has to name that same image: a sandbox_image the
-  # bundle does not carry is a cluster whose pods never start. Nothing is pulled
-  # either — an offline machine has nothing to pull from, and the pull that used
-  # to be here only ever failed quietly behind "|| true".
+  # bundle does not carry is a cluster whose pods never start, and containerd 2.x
+  # defaults to registry.k8s.io/pause:3.10.1 — newer than the pause a 1.28 cluster
+  # ships with — which an offline machine cannot pull.
+  #
+  # Added rather than rewritten: containerd 2.x's default config carries no
+  # sandbox_image line at all. And kubelet's --pod-infra-container-image no longer
+  # decides this, which is what its deprecation warning says: kubelet asks CRI.
   if [[ "$OFFLINE_INSTALL" == "true" ]]; then
-    sed -i "s|^sandbox_image = .*|sandbox_image = \"${REGISTRY}/pause:${PAUSE_VERSION}\"|" /etc/containerd/config.toml
+    # Computed here rather than read from REGISTRY and PAUSE_VERSION, which are
+    # set later in the run — this function is called before both, and the empty
+    # values silently produced sandbox_image = "/pause:", which containerd
+    # accepts and the kubelet then fails to resolve.
+    local pause_registry="${K8S_REGISTR}"
+    if [[ "$ZONE" == cn ]]; then
+      pause_registry="${CN_K8S_REGISTR}"
+    fi
+    local pause_version="${PAUSE_VERSION:-3.9}"
+    local sandbox="${pause_registry}/pause:${pause_version}"
+
+    # Which table the key belongs to changed: containerd 2.x split the CRI plugin
+    # and sandbox_image moved to io.containerd.cri.v1.images, while 1.x keeps it
+    # in io.containerd.grpc.v1.cri. Writing it in the wrong table is accepted in
+    # silence and ignored, which leaves the kubelet looking for the pause image
+    # containerd defaults to — registry.k8s.io/pause:3.10.1 on 2.2, which an
+    # offline machine cannot pull. The section headers are indented, so the match
+    # allows leading space and the inserted line copies it.
+    local cri_table=""
+    local candidate
+    for candidate in 'io\.containerd\.cri\.v1\.images' 'io\.containerd\.grpc\.v1\.cri'; do
+      if grep -qE "^[[:space:]]*\[plugins\.[^]]*${candidate}" /etc/containerd/config.toml; then
+        cri_table="${candidate}"
+        break
+      fi
+    done
+
+    if [ -n "${cri_table}" ]; then
+      awk -v img="${sandbox}" -v table="${cri_table}" '
+        { print }
+        !done && $0 ~ "^[[:space:]]*\\[plugins\\.[^]]*" table {
+          match($0, /^[[:space:]]*/)
+          print substr($0, 1, RLENGTH) "sandbox_image = \"" img "\""
+          done = 1
+        }
+      ' /etc/containerd/config.toml > /etc/containerd/config.toml.new
+      mv /etc/containerd/config.toml.new /etc/containerd/config.toml
+    else
+      # No CRI section at all: write the table the modern layout expects.
+      cat >> /etc/containerd/config.toml <<EOF
+
+[plugins.'io.containerd.cri.v1.images']
+  sandbox_image = "${sandbox}"
+EOF
+    fi
+
+    if grep -qE "sandbox_image = \"${pause_registry}/pause:" /etc/containerd/config.toml; then
+      clog debug "containerd sandbox_image: $(grep sandbox_image /etc/containerd/config.toml | head -1 | tr -s ' ')"
+      clog debug "containerd cri table: ${cri_table:-appended io.containerd.cri.v1.images}"
+    else
+      clog error "the containerd sandbox_image is missing or malformed; the kubelet would look for the pause image containerd defaults to and never find it offline"
+      exit 1
+    fi
+
+    # The daemon was started earlier in this same function, before this edit, so
+    # it is running the config from before the edit: containerd only reads
+    # /etc/containerd/config.toml at startup, and "enable --now" on a running
+    # unit does nothing. Without this restart everything above is written,
+    # verified and then ignored.
+    systemctl restart containerd
+    systemctl is-active --quiet containerd \
+      || { clog error "containerd did not come back after the sandbox_image change"; exit 1; }
   elif [[ "$ZONE" == cn ]];then
     sed -i 's|k8s.gcr.io/pause|registry.cn-hangzhou.aliyuncs.com/k8sxio/pause|' /etc/containerd/config.toml
     ctr -n k8s.io i pull registry.cn-hangzhou.aliyuncs.com/k8sxio/pause:3.5 || true
@@ -366,7 +431,12 @@ function k8s_bin_get() {
   # used to be written only on the download path, which left the offline path
   # with a kubelet that could not start at all.
   if [[ ${CONTAINER_RUNTIME} = "containerd" ]]; then
-    sed -i '2a\Environment="KUBELET_EXTRA_ARGS=--runtime-cgroups=/system.slice/containerd.service --container-runtime=remote --runtime-request-timeout=15m --container-runtime-endpoint=unix:///run/containerd/containerd.sock"' /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+    # --container-runtime is deliberately absent: kubelet removed it in 1.27 when
+    # dockershim went away, and a kubelet that is handed it refuses to start at
+    # all — "failed to parse kubelet flag: unknown flag: --container-runtime" —
+    # which reads as a broken node rather than a stale flag. The endpoint is what
+    # selects the runtime now.
+    sed -i '2a\Environment="KUBELET_EXTRA_ARGS=--runtime-cgroups=/system.slice/containerd.service --runtime-request-timeout=15m --container-runtime-endpoint=unix:///run/containerd/containerd.sock"' /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
   fi
 }
 
