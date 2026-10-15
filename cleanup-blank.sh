@@ -116,6 +116,45 @@ function stop_docker() {
   remove_pkgs docker.io docker-ce docker-ce-cli containerd.io containerd runc
 }
 
+# stop_kubeadm removes a cluster the kubeadm path installed.
+#
+# kubeadm reset is the canonical way to take its iptables rules away: kube-proxy
+# and the CNI leave chains and jump rules in INPUT, FORWARD and the nat table,
+# and deleting the files alone leaves a host that still routes like a cluster.
+# The rest are the paths that survive the reset.
+function stop_kubeadm() {
+  if command -v kubeadm > /dev/null 2>&1; then
+    if [ "${DO_IT}" = "true" ]; then
+      kubeadm reset -f > /dev/null 2>&1 || true
+      log "ran kubeadm reset"
+    else
+      warn "would run kubeadm reset"
+    fi
+  fi
+
+  if [ "${DO_IT}" = "true" ]; then
+    systemctl stop kubelet > /dev/null 2>&1 || true
+  else
+    warn "would stop kubelet"
+  fi
+
+  remove /etc/kubernetes
+  remove /var/lib/kubelet
+  remove /var/lib/etcd
+  remove /etc/containerd
+  remove /var/lib/cni
+  remove /usr/libexec/kubernetes
+  remove /etc/systemd/system/kubelet.service
+  remove /etc/systemd/system/kubelet.service.d
+  remove /usr/local/bin/kubeadm
+  remove /usr/local/bin/kubelet
+  remove /usr/local/bin/kubectl
+
+  if [ "${DO_IT}" = "true" ]; then
+    systemctl daemon-reload > /dev/null 2>&1 || true
+  fi
+}
+
 function remove_toolchain() {
   remove /usr/local/go
   remove /usr/lib/go-1.22
@@ -193,6 +232,8 @@ function assert_blank() {
   local path
   for path in /usr/local/bin/k0s /etc/k0s /var/lib/k0s /etc/docker /var/lib/docker \
     /var/lib/containerd /opt/containerd /opt/cni /etc/cni \
+    /etc/kubernetes /var/lib/kubelet /var/lib/etcd /etc/containerd /var/lib/cni \
+    /usr/local/bin/kubeadm /usr/local/bin/kubelet \
     /usr/local/go /root/go /etc/kubecube /root/.kube /usr/local/bin/helm; do
     if [ -e "${path}" ]; then
       warn "still present: ${path}"
@@ -203,7 +244,7 @@ function assert_blank() {
   done
 
   local cmd
-  for cmd in docker k0s helm kubectl go containerd ctr runc dockerd; do
+  for cmd in docker k0s helm kubectl go containerd ctr runc dockerd kubeadm kubelet; do
     if command -v "${cmd}" > /dev/null 2>&1; then
       warn "still on PATH: ${cmd} ($(command -v "${cmd}"))"
       ok=false
@@ -297,6 +338,7 @@ function Main() {
   fi
 
   stop_k0s
+  stop_kubeadm
   stop_docker
   remove_cni_leftovers
   remove_toolchain

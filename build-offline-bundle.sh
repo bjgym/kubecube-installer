@@ -58,6 +58,24 @@ source <(sed 's/\r$//' "${INSTALLER_DIR}/install.conf")
 KUBERNETES_DISTRO=${BUNDLE_DISTRO:-${KUBERNETES_DISTRO}}
 KUBERNETES_VERSION=${BUNDLE_KUBERNETES_VERSION:-${KUBERNETES_VERSION}}
 
+# The kubeadm path installs calico and only calico: it applies
+# manifests/cni/<cni>/v<version>, and the offline package fetches the calico
+# manifest. Deciding it here rather than in one of the files written below keeps
+# bundle.env and install.conf from disagreeing about which CNI the bundle is for.
+if [ "${KUBERNETES_DISTRO}" = "kubeadm" ]; then
+  CNI="calico"
+fi
+
+# The image repository the kubeadm path tells kubeadm to use. install_k8s.sh
+# picks it from ZONE and writes it into the kubeadm config as imageRepository, so
+# the bundle has to carry the images under that same name or the install pulls
+# from a registry an offline machine cannot reach. Keep the two in step.
+if [ "${ZONE}" = "cn" ]; then
+  KUBEADM_IMAGE_REPOSITORY="registry.cn-hangzhou.aliyuncs.com/google_containers"
+else
+  KUBEADM_IMAGE_REPOSITORY="k8s.gcr.io"
+fi
+
 ARCH=$(case "$(uname -m)" in
   x86_64) echo amd64 ;;
   aarch64 | arm64) echo arm64 ;;
@@ -796,16 +814,54 @@ function build_kubeadm_offline() {
   tar -czf "${dir}/cni-plugins-linux-${ARCH}-${cni_version}.tgz" -C "${cni_bin}" .
   rm -rf "${tmp}/cni"
 
+  # 3b. crictl, which kubeadm's preflight refuses to run without: "crictl not
+  # found in system path" is a fatal error, not a warning. It is published on
+  # GitHub releases, which is blocked here, so the mirrors that carry GitHub
+  # content are tried. The version follows the Kubernetes minor version because
+  # install_k8s.sh derives it the same way — crictl up to 1.25 speaks CRI
+  # v1alpha2, containerd 2.x serves only v1, and the older client makes a working
+  # runtime look broken.
+  local crictl_version="v1.17.0"
+  if [ "$(echo "${KUBERNETES_VERSION}" | cut -d. -f2)" -ge 22 ]; then
+    crictl_version="v1.$(echo "${KUBERNETES_VERSION}" | cut -d. -f2).0"
+  fi
+  local crictl_tar="${dir}/crictl-${crictl_version}-linux-${ARCH}.tar.gz"
+  if [ -s "${crictl_tar}" ]; then
+    log "have crictl ${crictl_version}, not fetching it again"
+  else
+    local crictl_src
+    for crictl_src in \
+      "https://ghfast.top/https://github.com/kubernetes-sigs/cri-tools/releases/download/${crictl_version}" \
+      "https://gh-proxy.com/https://github.com/kubernetes-sigs/cri-tools/releases/download/${crictl_version}"; do
+      if curl -sSLf -m 300 -o "${crictl_tar}" "${crictl_src}/crictl-${crictl_version}-linux-${ARCH}.tar.gz"; then
+        log "crictl ${crictl_version} from ${crictl_src%%/https*}"
+        break
+      fi
+      warn "${crictl_src} did not work"
+    done
+  fi
+  # A truncated download installs a crictl that kubeadm then fails to run, so
+  # check the archive really carries the binary.
+  tar -tzf "${crictl_tar}" 2> /dev/null | grep -qx crictl \
+    || die "crictl-${crictl_version}-linux-${ARCH}.tar.gz does not contain crictl"
+
   # 4. the container runtime, as packages rather than the tarball the online path
-  # downloads from the distribution host. containerd brings its own dependencies
-  # this way; downloading the one package by hand would miss runc.
+  # downloads from the distribution host, plus the two tools kubeadm's preflight
+  # insists on.
   #
-  # --reinstall is what makes this work on a build host that already has
-  # containerd — docker.io pulls it in — because apt otherwise reports "already
-  # the newest version" and downloads nothing, leaving the check below to fail.
-  (cd "${dir}" && apt-get install -y --reinstall --download-only -o Dir::Cache::archives="${dir}" containerd > /dev/null 2>&1) \
-    || die "could not download containerd and its dependencies"
-  ls "${dir}"/containerd_*.deb > /dev/null 2>&1 || die "no containerd package landed in ${dir}"
+  # Every package is named and fetched with "apt-get download" rather than
+  # "install --download-only": the latter resolves dependencies against what the
+  # build host already has, and a host with docker already has containerd and
+  # runc, so it downloaded neither — the bundle shipped without runc and dpkg on
+  # the target refused to configure containerd at all. conntrack is here because
+  # kubeadm refuses to run without the binary, and libnetfilter-conntrack3 is its
+  # library, which the same reasoning would otherwise leave behind.
+  (cd "${dir}" && apt-get download containerd runc conntrack libnetfilter-conntrack3 > /dev/null 2>&1) \
+    || die "could not download the runtime and conntrack packages"
+  local pkg
+  for pkg in containerd runc conntrack libnetfilter-conntrack3; do
+    ls "${dir}"/"${pkg}"_*.deb > /dev/null 2>&1 || die "no ${pkg} package landed in ${dir}"
+  done
 
   # 5. the CNI manifest, and a check that the images it names are the ones this
   # bundle carries. install_k8s.sh applies manifests/cni/<cni>/v<version>, so it
@@ -842,15 +898,31 @@ function build_kubeadm_offline() {
   mkdir -p "${OUT}/manifests/cni/calico/${release}"
   cp -a "${calico_manifest}" "${OUT}/manifests/cni/calico/${release}/calico.yaml"
 
-  # 6. the images: the ones images/k8s/<version>/images.list names, which the
-  # manifest above has to agree with — a manifest naming an image the bundle
-  # does not carry is a cluster whose CNI never starts.
+  # 6. the images: the control-plane set comes from kubeadm itself, the CNI images
+  # from images.list, and the manifest above has to agree with the second.
+  #
+  # Asking kubeadm rather than reading a hand-written list is what keeps this
+  # right: "kubeadm config images list" prints exactly what "kubeadm init" will
+  # pull, tags included. A hand-written list is correct until a patch release
+  # moves a tag — 1.28.15 wants etcd 3.5.15-0, not the 3.5.9-0 the file used to
+  # name — and the failure then lands on an offline machine as an ImagePull error
+  # from a registry it cannot reach.
   local images=()
   local image
   while read -r image; do
     [ -n "${image}" ] || continue
     images+=("${image}")
-  done < <(sed -e 's/#.*$//' -e '/^[[:space:]]*$/d' "${INSTALLER_DIR}/images/k8s/v${KUBERNETES_VERSION}/images.list")
+  done < <("${dir}/kubeadm" config images list --kubernetes-version "v${KUBERNETES_VERSION}" \
+    --image-repository "${KUBEADM_IMAGE_REPOSITORY}" 2> /dev/null)
+  [ ${#images[@]} -gt 0 ] || die "kubeadm config images list named no images"
+
+  # the CNI images, which kubeadm knows nothing about
+  while read -r image; do
+    [ -n "${image}" ] || continue
+    images+=("${image}")
+  done < <(sed -e 's/#.*$//' -e '/^[[:space:]]*$/d' "${INSTALLER_DIR}/images/k8s/v${KUBERNETES_VERSION}/images.list" \
+    | grep '^docker\.io/calico/')
+  [ ${#images[@]} -gt 0 ] || die "images/k8s/v${KUBERNETES_VERSION}/images.list names no calico images"
 
   local from_manifest
   from_manifest=$(grep -oE 'image: *"?[^"[:space:]]+"?' "${dir}/calico.yaml" \
@@ -867,9 +939,24 @@ function build_kubeadm_offline() {
   fi
 
   for image in "${images[@]}"; do
-    pull_with_fallback "${image}" \
-      "$(echo "${image}" | sed -e 's#^docker\.io/#docker.1ms.run/#' -e 's#^registry\.k8s\.io/#registry.cn-hangzhou.aliyuncs.com/google_containers/#')" \
-      "${image}"
+    # Mirrors that answer where docker.io and registry.k8s.io do not. The target
+    # name is always the one images.list and the calico manifest agree on, so a
+    # mirror is pulled from and then retagged.
+    local sources=()
+    case "${image}" in
+      docker.io/*) sources+=("$(echo "${image}" | sed 's#^docker\.io/#docker.1ms.run/#')") ;;
+      registry.k8s.io/*) sources+=("$(echo "${image}" | sed 's#^registry\.k8s\.io/#registry.cn-hangzhou.aliyuncs.com/google_containers/#')") ;;
+    esac
+    # calico publishes the same images on quay.io, which answered for the ones
+    # the docker.io mirrors did not carry
+    case "${image}" in
+      docker.io/calico/*)
+        sources+=("quay.io/$(echo "${image}" | sed 's#^docker\.io/##')")
+        sources+=("hub.rat.dev/$(echo "${image}" | sed 's#^docker\.io/##')")
+        ;;
+    esac
+    sources+=("${image}")
+    pull_with_fallback "${image}" "${sources[@]}"
   done
 
   save_archive "${dir}/offline_images.tar" "${images[@]}"
@@ -888,8 +975,11 @@ function Main() {
   rm -rf "${OUT}/bin" "${OUT}/charts" "${OUT}/k0s" "${OUT}/images" "${OUT}/manifests"
   mkdir -p "${OUT}"/{manifests,charts,k0s,images,bin}
 
-  # the installer scripts travel in the bundle: the target machine has no copy
-  for f in entry.sh install.sh install_k8s.sh install_k0s.sh install_kubecube.sh install_member.sh utils.sh cleanup.sh; do
+  # the installer scripts travel in the bundle: the target machine has no copy.
+  # The build and ops tools travel too, so the bundle can rebuild itself and be
+  # returned to a blank host without the repository.
+  for f in entry.sh install.sh install_k8s.sh install_k0s.sh install_kubecube.sh install_member.sh utils.sh cleanup.sh \
+    cleanup-blank.sh prepare-build-host.sh build-offline-bundle.sh normalize-image-tar.py; do
     if [ -f "${INSTALLER_DIR}/${f}" ]; then
       cp -a "${INSTALLER_DIR}/${f}" "${OUT}/manifests/"
     else

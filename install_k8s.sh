@@ -305,7 +305,15 @@ EOF
   systemctl enable containerd --now || true
 
   #configuration pause
-  if [[ "$ZONE" == cn ]];then
+  #
+  # Offline the pause image is already in the bundle, under the name images.list
+  # gives it, so the config has to name that same image: a sandbox_image the
+  # bundle does not carry is a cluster whose pods never start. Nothing is pulled
+  # either — an offline machine has nothing to pull from, and the pull that used
+  # to be here only ever failed quietly behind "|| true".
+  if [[ "$OFFLINE_INSTALL" == "true" ]]; then
+    sed -i "s|^sandbox_image = .*|sandbox_image = \"${REGISTRY}/pause:${PAUSE_VERSION}\"|" /etc/containerd/config.toml
+  elif [[ "$ZONE" == cn ]];then
     sed -i 's|k8s.gcr.io/pause|registry.cn-hangzhou.aliyuncs.com/k8sxio/pause|' /etc/containerd/config.toml
     ctr -n k8s.io i pull registry.cn-hangzhou.aliyuncs.com/k8sxio/pause:3.5 || true
     ctr -n k8s.io i tag registry.cn-hangzhou.aliyuncs.com/k8sxio/pause:3.5 k8s.gcr.io/pause:3.5 || true
@@ -322,13 +330,24 @@ function k8s_bin_get() {
   fi
 
   CNI_VERSION="v0.8.2"
-  CRICTL_VERSION="v1.17.0"
   RELEASE_VERSION="v0.4.0"
   DOWNLOAD_DIR=/usr/local/bin
+  # The pause image the bundle carries; images/k8s/<version>/images.list names the
+  # same one, and containerd's sandbox_image has to agree with it or pods never
+  # get a sandbox.
+  PAUSE_VERSION="3.9"
 
+  # crictl tracks the Kubernetes minor version, and that matters more than it
+  # looks: crictl up to 1.25 speaks CRI v1alpha2, containerd 2.x serves only v1,
+  # and kubeadm's preflight asks crictl for the runtime status. A v1.22.0 crictl
+  # against containerd 2.2 fails with "unknown service
+  # runtime.v1alpha2.RuntimeService", which reads like a broken container runtime
+  # and is really a client that is too old. The bundle carries the file this name
+  # resolves to, so the builder derives it the same way.
+  CRICTL_VERSION="v1.17.0"
   K8S_VERSION_MAIN=$(echo "$KUBERNETES_VERSION"|cut -d. -f2)
-  if [ $K8S_VERSION_MAIN -gt 22 ]; then
-    CRICTL_VERSION="v1.22.0"
+  if [ $K8S_VERSION_MAIN -gt 21 ]; then
+    CRICTL_VERSION="v1.${K8S_VERSION_MAIN}.0"
   fi
 
   mkdir -p /opt/cni/bin
@@ -369,9 +388,13 @@ function k8s_bin_local() {
   fi
 
   clog debug "get kubeadm,kubelet,kubectl"
-  mv ${OFFLINE_PKG_PATH}/kubeadm $DOWNLOAD_DIR
-  mv ${OFFLINE_PKG_PATH}/kubelet $DOWNLOAD_DIR
-  mv ${OFFLINE_PKG_PATH}/kubectl $DOWNLOAD_DIR
+  # Copied, not moved. The offline package is the only source of these three
+  # binaries, and moving them out of it leaves a bundle that installs a cluster
+  # exactly once: a second run — after a failure, or on a second machine that
+  # shares the package — fails on a kubeadm that is no longer there.
+  cp -a ${OFFLINE_PKG_PATH}/kubeadm $DOWNLOAD_DIR
+  cp -a ${OFFLINE_PKG_PATH}/kubelet $DOWNLOAD_DIR
+  cp -a ${OFFLINE_PKG_PATH}/kubectl $DOWNLOAD_DIR
   # One path per argument. The brace form "{a,b,c}" is not expansion, it is a
   # single word with braces in it, so the old chmod matched nothing and left the
   # three binaries without the execute bit.
@@ -556,8 +579,23 @@ if [ -z ${CONTROL_PLANE_ENDPOINT} ]; then
   CONTROL_PLANE_ENDPOINT=${IPADDR}
 fi
 
+# Which kubeadm config API to write. v1beta2 is what 1.15 through 1.21 read;
+# 1.22 moved to v1beta3, and kubeadm 1.28 refuses to migrate v1beta2 at all —
+# "your configuration file uses an old API spec ... Please use kubeadm v1.22
+# instead" — which is where installing 1.28 from this path stopped. v1beta3 is
+# accepted from 1.22 through 1.29 and migrates cleanly to the v1beta4 that 1.27+
+# writes, so one spec covers everything the installer supports and the migrate
+# step below still runs.
+local minor
+minor=$(echo "${KUBERNETES_VERSION}" | cut -d. -f2)
+KUBEADM_API="kubeadm.k8s.io/v1beta2"
+if [ "${minor}" -ge 22 ]; then
+  KUBEADM_API="kubeadm.k8s.io/v1beta3"
+fi
+clog debug "kubeadm config api ${KUBEADM_API} for kubernetes ${KUBERNETES_VERSION}"
+
 cat >/etc/cube/kubeadm/init.config <<EOF
-apiVersion: kubeadm.k8s.io/v1beta2
+apiVersion: ${KUBEADM_API}
 kind: ClusterConfiguration
 kubernetesVersion: ${KUBERNETES_VERSION}
 controlPlaneEndpoint: ${CONTROL_PLANE_ENDPOINT}

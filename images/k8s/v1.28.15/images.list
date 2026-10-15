@@ -1,24 +1,16 @@
 # Kubernetes 1.28.15 images for the kubeadm path.
 #
-# Same shape and the same registry choices as the other versions here: the
-# control-plane images come from the aliyun mirror of registry.k8s.io, which is
-# reachable from networks where registry.k8s.io is not.
+# The control-plane images are deliberately not listed here. build-offline-bundle.sh
+# asks kubeadm itself — "kubeadm config images list", with the image repository the
+# installer uses — because a hand-written list goes stale the moment a patch release
+# moves a tag: 1.28.15 wants etcd 3.5.15-0, and naming 3.5.9-0 here is what made an
+# offline install try to pull from a registry it cannot reach.
 #
-# The calico images are the upstream ones rather than a re-hosted copy: the
-# project's own `kubecube/calico-*:vX-m` tags exist for the versions it has
-# repackaged, and 1.28 is not one of them. The manifest that goes with this file
-# (cni/calico/v1.28.15/calico.yaml) has to name the same images.
-#
-# Versions are what kubeadm 1.28.15 itself defaults to: etcd 3.5.9-0, coredns
-# v1.10.1, pause 3.9.
-
-registry.cn-hangzhou.aliyuncs.com/google_containers/kube-apiserver:v1.28.15
-registry.cn-hangzhou.aliyuncs.com/google_containers/kube-controller-manager:v1.28.15
-registry.cn-hangzhou.aliyuncs.com/google_containers/kube-scheduler:v1.28.15
-registry.cn-hangzhou.aliyuncs.com/google_containers/kube-proxy:v1.28.15
-registry.cn-hangzhou.aliyuncs.com/google_containers/pause:3.9
-registry.cn-hangzhou.aliyuncs.com/google_containers/etcd:3.5.9-0
-registry.cn-hangzhou.aliyuncs.com/google_containers/coredns:v1.10.1
+# What is left is the CNI, which kubeadm knows nothing about. These are the upstream
+# calico images rather than a re-hosted copy: the project's own kubecube/calico-*:vX-m
+# tags exist for the versions it has repackaged, and 1.28 is not one of them. The
+# manifest that goes with this file (cni/calico/v1.28.15/calico.yaml) has to name the
+# same images, which the builder checks and refuses to build if they disagree.
 
 docker.io/calico/node:v3.26.4
 docker.io/calico/cni:v3.26.4
