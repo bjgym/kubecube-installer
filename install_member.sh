@@ -84,6 +84,56 @@ fi
 # to find it.
 NS=${INSTALL_NAMESPACE:-kubecube-system}
 
+# open_member_apiserver lets the pivot reach this cluster's API server.
+#
+# Registration runs the other way: the member's warden dials out to the pivot, so
+# onboarding looks healthy while the pivot is unable to dial back — and it stays
+# unable. What that produces is a Cluster stuck at `processing` while its warden
+# is 1/1 on this side, and "confirm warden in cluster <name> failed, try
+# redeploy" in the pivot's cube log.
+#
+# On a host that filters inbound traffic — UFW's default posture on Ubuntu — the
+# API server's port has to be opened to the pivot explicitly. The kubeadm path
+# sets only the FORWARD policy, and nothing else in either installer knows the
+# pivot's address, which is why this is here rather than in install_k8s.sh.
+function open_member_apiserver() {
+  local pivot_ip=${PIVOT_CUBE_HOST%%:*}
+  local port=${APISERVER_PORT:-6443}
+
+  case "${pivot_ip}" in
+    '' | *[!0-9.]*)
+      # A name resolves to whatever it resolves to on the pivot's own side, and
+      # opening a port to something this host cannot resolve is guesswork.
+      clog warn "PIVOT_CUBE_HOST is not an IPv4 literal; if this host filters inbound traffic, open port ${port} to the pivot by hand"
+      return 0
+      ;;
+  esac
+
+  if command -v ufw > /dev/null 2>&1 && ufw status 2> /dev/null | grep -q "^Status: active"; then
+    if ufw allow from "${pivot_ip}" to any port "${port}" proto tcp > /dev/null 2>&1; then
+      clog info "allowed ${pivot_ip} to reach this cluster's API server on ${port} (ufw)"
+    else
+      clog warn "could not add the ufw rule for ${pivot_ip} to reach ${port}"
+    fi
+    return 0
+  fi
+
+  if iptables -S INPUT 2> /dev/null | grep -q "^-P INPUT DROP"; then
+    while iptables -D INPUT -s "${pivot_ip}" -p tcp --dport "${port}" -j ACCEPT > /dev/null 2>&1; do :; done
+    if iptables -I INPUT 1 -s "${pivot_ip}" -p tcp --dport "${port}" -j ACCEPT > /dev/null 2>&1; then
+      clog info "allowed ${pivot_ip} to reach this cluster's API server on ${port} (iptables)"
+      # Said plainly: a rule added here is gone at the next boot, and a member
+      # that stops answering after a reboot is a confusing failure to debug.
+      clog warn "that rule does not survive a reboot: make it permanent in this host's firewall configuration"
+    else
+      clog warn "could not add the iptables rule for ${pivot_ip} to reach ${port}"
+    fi
+    return 0
+  fi
+
+  clog info "this host does not filter inbound traffic; the pivot can already reach its API server"
+}
+
 # The pivot's JWT secret, written into both of the keys that have to agree. The
 # default is the chart's own default, which is what a pivot installed without
 # overriding it uses.
@@ -203,6 +253,13 @@ function wait_member_ready() {
   KUBECONFIG="${MEMBER_KUBECONFIG}" kubectl -n "${NS}" describe pods | tail -80
   exit 1
 }
+
+# Two single-line omissions that both surface as something else. A one-node
+# member keeps the control-plane taint, so its own warden never schedules and the
+# install waits out its timeout. And an unopened API server port leaves the pivot
+# unable to dial the cluster it just registered, which reads as a broken member.
+untaint_single_node "${MEMBER_KUBECONFIG}"
+open_member_apiserver
 
 render_values
 

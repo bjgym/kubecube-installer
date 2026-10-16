@@ -41,9 +41,12 @@ then
   # A one-node cluster has to run the platform's pods itself. k0s --single
   # already leaves the node untainted, so this only bites the kubeadm path; the
   # removal is harmless when there is no taint to remove.
+  #
+  # The removal itself lives in utils.sh because the member installer needs the
+  # same thing for the same reason, on a cluster whose kubeconfig is not the one
+  # KUBECONFIG points at.
   echo "[WARN]delete taint of master node while only one node found"
-  kubectl get nodes | grep -v "NAME" | awk '{print $1}' | sed -n '1p' | xargs -t -i kubectl taint node {} node-role.kubernetes.io/master- > /dev/null 2>&1
-  kubectl get nodes | grep -v "NAME" | awk '{print $1}' | sed -n '1p' | xargs -t -i kubectl taint node {} node-role.kubernetes.io/control-plane- > /dev/null 2>&1
+  untaint_single_node
 fi
 
 if [ ! -z ${KUBERNETES_BIND_ADDRESS} ]; then

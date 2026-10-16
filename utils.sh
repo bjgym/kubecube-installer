@@ -123,6 +123,52 @@ function kubectl_with_retry() {
     return ${ret}
 }
 
+# untaint_single_node removes the control-plane taint from a one-node cluster.
+#
+# A one-node cluster has to run the platform's own pods, so the taint that keeps
+# ordinary workloads off a control plane has to go. k0s --single already leaves
+# the node untainted, which is why this only bites the kubeadm path.
+#
+# Both keys are handled: the key was renamed from `master` to `control-plane`,
+# and 1.28 — the version this installer pins — is the last line that uses the old
+# one. A member is not necessarily on the same version as its pivot.
+#
+# Shared by the pivot and the member installers, because the symptom is the same
+# on both and only one of them used to do anything about it: the member's pods
+# stay Pending with "0/1 nodes are available: 1 node(s) had untolerated taint
+# {node-role.kubernetes.io/control-plane}", and the install waits on them.
+#
+# Takes an optional kubeconfig, because the member installer talks to a cluster
+# that is not necessarily the one KUBECONFIG points at.
+function untaint_single_node() {
+  local kubeconfig=${1:-}
+  local kubectl_args=()
+  if [ -n "${kubeconfig}" ]; then
+    kubectl_args=(--kubeconfig "${kubeconfig}")
+  fi
+
+  local nodes node key
+  nodes=$(kubectl "${kubectl_args[@]}" get nodes --no-headers 2> /dev/null | wc -l)
+  if [ "${nodes}" -ne 1 ]; then
+    return 0
+  fi
+
+  node=$(kubectl "${kubectl_args[@]}" get nodes --no-headers 2> /dev/null | awk 'NR==1{print $1}')
+  if [ -z "${node}" ]; then
+    return 0
+  fi
+
+  for key in node-role.kubernetes.io/master node-role.kubernetes.io/control-plane; do
+    if kubectl "${kubectl_args[@]}" get node "${node}" -o go-template='{{range .spec.taints}}{{.key}}{{"\n"}}{{end}}' 2> /dev/null | grep -qx "${key}"; then
+      if kubectl "${kubectl_args[@]}" taint node "${node}" "${key}-" > /dev/null 2>&1; then
+        clog info "removed the ${key} taint from ${node}: a one-node cluster runs the platform's pods itself"
+      else
+        clog warn "could not remove the ${key} taint from ${node}"
+      fi
+    fi
+  done
+}
+
 function helm_download() {
   # Only a host that has no helm needs the download. The offline bundle installs
   # helm itself, and reaching for the distribution host from a machine with no
