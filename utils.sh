@@ -169,6 +169,97 @@ function untaint_single_node() {
   done
 }
 
+# agent_kubeconfig writes a kubeconfig for a ServiceAccount, using an admin
+# kubeconfig only to create it.
+#
+# The platform keeps a kubeconfig for every cluster it manages, and a warden
+# keeps one for the cluster it runs in. Both used to be that cluster's admin
+# kubeconfig — a credential that cannot be narrowed and cannot be revoked:
+# whoever holds it can do anything to that cluster for as long as it exists. What
+# is written here instead is a ServiceAccount token, limited to the ClusterRole
+# the caller has already bound to the account and revocable by deleting the
+# Secret. The admin kubeconfig stays what it always was: the operator's own
+# credential, used at install time and not left behind in a Secret.
+#
+# The token Secret is of kind kubernetes.io/service-account-token rather than the
+# output of `kubectl create token`, which expires in an hour: a member whose
+# warden loses its credential an hour after the install is worse than one that
+# was never installed at all. The same Secret carries the cluster CA, so nothing
+# here has to decode a kubeconfig to find it.
+#
+#   agent_kubeconfig <admin-kubeconfig> <serviceaccount> <namespace> <output-file>
+function agent_kubeconfig() {
+  local admin=$1 sa=$2 ns=$3 out=$4
+  local secret="${sa}-token"
+  local token="" server="" ca="" waited=0
+
+  kubectl --kubeconfig "${admin}" -n "${ns}" apply -f - <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${sa}
+  namespace: ${ns}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${secret}
+  namespace: ${ns}
+  annotations:
+    kubernetes.io/service-account.name: ${sa}
+type: kubernetes.io/service-account-token
+EOF
+  if [ $? -ne 0 ]; then
+    clog error "could not create ${ns}/${sa}"
+    return 1
+  fi
+
+  # The token controller fills the Secret in asynchronously.
+  while [ "${waited}" -lt 60 ]; do
+    token=$(kubectl --kubeconfig "${admin}" -n "${ns}" get secret "${secret}" -o go-template='{{.data.token}}' 2> /dev/null | base64 -d 2> /dev/null || true)
+    if [ -n "${token}" ]; then
+      break
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  if [ -z "${token}" ]; then
+    clog error "no token was issued for ${ns}/${sa} within 60s"
+    return 1
+  fi
+
+  # ca.crt stays base64: that is exactly what certificate-authority-data wants.
+  ca=$(kubectl --kubeconfig "${admin}" -n "${ns}" get secret "${secret}" -o go-template='{{index .data "ca.crt"}}' 2> /dev/null || true)
+  server=$(kubectl --kubeconfig "${admin}" config view --minify 2> /dev/null | awk '/^[[:space:]]*server:/{print $2; exit}')
+
+  if [ -z "${ca}" ] || [ -z "${server}" ]; then
+    clog error "could not read the CA or the server address for ${ns}/${sa}"
+    return 1
+  fi
+
+  cat > "${out}" <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+  - name: agent
+    cluster:
+      server: ${server}
+      certificate-authority-data: ${ca}
+users:
+  - name: agent
+    user:
+      token: ${token}
+contexts:
+  - name: agent
+    context:
+      cluster: agent
+      user: agent
+current-context: agent
+EOF
+  chmod 0600 "${out}"
+  clog info "wrote ${out} for ${ns}/${sa}, server ${server}"
+}
+
 function helm_download() {
   # Only a host that has no helm needs the download. The offline bundle installs
   # helm itself, and reaching for the distribution host from a machine with no

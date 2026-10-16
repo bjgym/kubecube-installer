@@ -139,7 +139,12 @@ function open_member_apiserver() {
 # overriding it uses.
 PIVOT_JWT_SECRET=${PIVOT_JWT_SECRET:-56F0D8DB90241C6E}
 
+# render_values takes the two kubeconfigs to embed. It is called twice: once with
+# the operator's own credentials, which is what creates the ServiceAccounts and
+# roles the scoped credentials are for, and once with the scoped ones, so that
+# what stays in the Secret is never an admin kubeconfig.
 function render_values() {
+  local local_kubeconfig=$1 pivot_kubeconfig=$2
   clog info "render member values for the kubecube chart (image tag ${KUBECUBE_IMAGE_TAG})"
   cat > member-values.yaml << EOF
 # Written by install_member.sh. The pivot's components are off, which is what
@@ -202,8 +207,8 @@ global:
     metricServer: "false"
 
   # local: this cluster. pivot: the platform, which the warden uses to report in.
-  localKubeConfig: $(base64 -w 0 < "${MEMBER_KUBECONFIG}")
-  pivotKubeConfig: $(base64 -w 0 < "${PIVOT_KUBECONFIG}")
+  localKubeConfig: $(base64 -w 0 < "${local_kubeconfig}")
+  pivotKubeConfig: $(base64 -w 0 < "${pivot_kubeconfig}")
 
 warden:
   containers:
@@ -261,9 +266,32 @@ function wait_member_ready() {
 untaint_single_node "${MEMBER_KUBECONFIG}"
 open_member_apiserver
 
-render_values
+render_values "${MEMBER_KUBECONFIG}" "${PIVOT_KUBECONFIG}"
 
 clog info "deploy the member side as ${MEMBER_CLUSTER_NAME}, registering with ${PIVOT_CUBE_HOST}"
+KUBECONFIG="${MEMBER_KUBECONFIG}" /usr/local/bin/helm upgrade --install kubecube -n "${NS}" --create-namespace \
+  /etc/kubecube/kubecube-chart -f ./member-values.yaml --wait --timeout 15m
+
+# The scoped credentials, now that the chart has created the ServiceAccounts and
+# the roles they are for.
+#
+# Two passes rather than one because of the order the objects have to exist in: a
+# kubeconfig is an *input* to the chart, and the ServiceAccount it names is
+# created *by* that chart. The first pass carries the operator's own kubeconfigs
+# and exists to create the accounts and rules; the second replaces both with
+# ServiceAccount tokens bound to templates/agent-rbac.yaml, so what stays in the
+# Secret afterwards — and what the warden registers with the pivot as this
+# cluster's kubeconfig — is a token that can be revoked and that carries no
+# secret read, no node write and no exec.
+member_agent_kubeconfig=/etc/kubecube/member-agent.kubeconfig
+pivot_agent_kubeconfig=/etc/kubecube/pivot-agent.kubeconfig
+
+clog info "mint the scoped credentials"
+agent_kubeconfig "${MEMBER_KUBECONFIG}" kubecube-member-agent "${NS}" "${member_agent_kubeconfig}" || exit 1
+agent_kubeconfig "${PIVOT_KUBECONFIG}" warden-agent "${NS}" "${pivot_agent_kubeconfig}" || exit 1
+
+render_values "${member_agent_kubeconfig}" "${pivot_agent_kubeconfig}"
+clog info "re-deploy the member side with the scoped credentials"
 KUBECONFIG="${MEMBER_KUBECONFIG}" /usr/local/bin/helm upgrade --install kubecube -n "${NS}" --create-namespace \
   /etc/kubecube/kubecube-chart -f ./member-values.yaml --wait --timeout 15m
 
