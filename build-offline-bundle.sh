@@ -714,6 +714,24 @@ FRONTEND_ENABLE="false"
 # install its subchart: it would sit in ImagePullBackOff and take the whole
 # helm release down with it. Ingress is a separate concern an operator turns
 # back on where they can get the image.
+#
+# The search, recorded so it is not repeated. The project's own images are amd64
+# only: kubecube/ingress-nginx-controller:v1.2.0 and
+# kubecube/ingress-nginx-kube-webhook-certgen:v1.1.1 both report
+# "architecture": "amd64". The arm64 builds live on registry.k8s.io, whose
+# backing host is unreachable from this network — a pull resolves to
+# *.pkg.dev and times out, even though /v2/ on registry.k8s.io answers. And none
+# of the mirrors this host can reach carries the image; every reference below was
+# tried and answers "does not exist":
+#
+#   registry.cn-hangzhou.aliyuncs.com/google_containers/ingress-nginx-controller
+#   registry.cn-hangzhou.aliyuncs.com/google_containers/ingress-nginx-kube-webhook-certgen
+#   docker.1ms.run/kubernetes-ingress-controller/ingress-nginx-controller
+#   hub.rat.dev/kubernetes-ingress-controller/ingress-nginx-controller
+#   quay.io/kubernetes-ingress-controller/ingress-nginx-controller
+#
+# What unblocks it: publish those two images as multi-arch in the project's own
+# registry, or run the controller on an amd64 node.
 INGRESS_CONTROLLER_ENABLE="false"
 EOF
   cp -a "${OUT}/manifests/install.conf" "${OUT}/install.conf"
