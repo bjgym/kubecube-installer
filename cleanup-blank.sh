@@ -313,28 +313,76 @@ function remove_cni_leftovers() {
     fi
   done
 
-  local chain
-  for chain in CILIUM_FORWARD CILIUM_INPUT CILIUM_OUTPUT CILIUM_POSTROUTING CILIUM_PRE_mangle CILIUM_POST_mangle; do
-    if iptables -L "${chain}" > /dev/null 2>&1; then
-      if [ "${DO_IT}" = "true" ]; then
-        # The jump rules come out first: a chain that is still referenced cannot
-        # be deleted, and the reference is what keeps cilium's view of the world
-        # in the packet path of the next cluster.
-        local table parent
-        for table in filter nat mangle; do
-          for parent in INPUT OUTPUT FORWARD PREROUTING POSTROUTING; do
-            while iptables -t "${table}" -D "${parent}" -j "${chain}" > /dev/null 2>&1; do :; done
-            while iptables -t "${table}" -D "${parent}" -m comment --comment "cilium-feeder: ${chain}" -j "${chain}" > /dev/null 2>&1; do :; done
-          done
-        done
-        iptables -F "${chain}" > /dev/null 2>&1 || true
-        iptables -X "${chain}" > /dev/null 2>&1 || true
-        log "removed iptables chain ${chain} and its jump rules"
+  # Every Cilium chain in every table, removed by pattern rather than by name.
+  #
+  # Naming them individually does not work: cilium creates CILIUM_PRE_nat,
+  # CILIUM_OUTPUT_nat, CILIUM_PRE_raw, CILIUM_POST_mangle and more across four
+  # tables, and the names move between versions. An earlier version of this
+  # function listed names that never matched, so the chains survived and stayed
+  # wired into OUTPUT, PREROUTING and POSTROUTING — and a leftover chain is not
+  # inert. It rewrites and drops traffic for whatever is installed next, which is
+  # how a kubeadm cluster on an "already cleaned" host ends up unable to reach
+  # its own service VIP: calico's install-cni cannot fetch a token, the node never
+  # gets a CNI, and it stays NotReady with every pod behind it Pending.
+  #
+  # Filtering the table dump and restoring it takes the chain declarations out
+  # together with every jump into them, which is the only way to leave the table
+  # consistent.
+  local table
+  for table in filter nat mangle raw; do
+    if ! iptables -t "${table}" -S > /dev/null 2>&1; then
+      continue
+    fi
+    if ! iptables -t "${table}" -S 2> /dev/null | grep -q CILIUM; then
+      continue
+    fi
+
+    if [ "${DO_IT}" = "true" ]; then
+      # -T, capital: iptables-restore's table flag is not the -t that every other
+      # iptables command uses, and with the wrong one it fails without touching
+      # the table. The dump carries its own "*nat"-style header, so the failure
+      # mode of forgetting the flag entirely is a restore that works anyway.
+      #
+      # Retried and then checked rather than trusted: the restore has been
+      # observed to succeed and leave the chains behind, and a silent failure
+      # here is the difference between a blank host and one whose packet path is
+      # still rewriting traffic.
+      local attempt=0
+      while [ "${attempt}" -lt 3 ] && iptables -t "${table}" -S 2> /dev/null | grep -q CILIUM; do
+        attempt=$((attempt + 1))
+        iptables-save -t "${table}" | grep -v CILIUM | iptables-restore -T "${table}" \
+          || warn "could not rewrite the ${table} table (attempt ${attempt})"
+      done
+
+      if iptables -t "${table}" -S 2> /dev/null | grep -q CILIUM; then
+        warn "Cilium's chains are still in the ${table} table: the next cluster's packet path is not clean"
       else
-        warn "would remove iptables chain ${chain}"
+        log "removed Cilium's chains from the ${table} table"
+      fi
+    else
+      warn "would remove Cilium's chains from the ${table} table"
+    fi
+  done
+
+  # The agent's runtime state outlives its iptables chains and confuses the next
+  # CNI on the machine. Cilium also mounts filesystems *under* these directories
+  # — /run/cilium/cgroupv2 is the usual one — so the unmount has to be
+  # recursive: rm -rf under a mount takes the contents and leaves the mount,
+  # which is why /run/cilium survived an earlier version of this.
+  local mp
+  for mp in /run/cilium /sys/fs/bpf/cilium; do
+    if mount | grep -q " ${mp}"; then
+      if [ "${DO_IT}" = "true" ]; then
+        umount -R "${mp}" > /dev/null 2>&1 || umount -lR "${mp}" > /dev/null 2>&1 || true
+        log "unmounted everything under ${mp}"
+      else
+        warn "would unmount everything under ${mp}"
       fi
     fi
   done
+  remove /run/cilium
+  remove /var/run/cilium
+  remove /sys/fs/bpf/cilium
 
   # the pod-network rules the provider inserts, and the unit drop-in that
   # reapplies them
