@@ -295,6 +295,45 @@ clog info "re-deploy the member side with the scoped credentials"
 KUBECONFIG="${MEMBER_KUBECONFIG}" /usr/local/bin/helm upgrade --install kubecube -n "${NS}" --create-namespace \
   /etc/kubecube/kubecube-chart -f ./member-values.yaml --wait --timeout 15m
 
+# The kubeconfigs live in a Secret, and a Secret change does not roll a
+# Deployment. The warden reads both files once at startup, so without this it
+# goes on using whatever it read before — the admin kubeconfig the first pass
+# gave it — and the second pass buys nothing while every check still looks green.
+clog info "restart the warden so it picks the scoped credentials up"
+KUBECONFIG="${MEMBER_KUBECONFIG}" kubectl -n "${NS}" rollout restart deploy/warden
+KUBECONFIG="${MEMBER_KUBECONFIG}" kubectl -n "${NS}" rollout status deploy/warden --timeout=300s
+
+# The pivot reads this cluster's kubeconfig from the Cluster CR, and the warden's
+# registration only ever creates that object: it treats AlreadyExists as success
+# and never updates it. So the scoped credential has to be written where the
+# pivot actually looks, or the pivot goes on dialling the member with whatever
+# the first pass registered — an admin kubeconfig, held by the cluster the
+# platform is meant to be managing with limited rights.
+#
+# A merge patch of that single field, not a re-apply of the object: applying a
+# full dump makes the platform re-ensure the member's resources, and the tenancy
+# objects it rewrites then carry an empty pivotResourceVersion, which its own
+# sync path cannot parse (strconv.Atoi fails and the object is skipped for good).
+cluster_creds_patch=/tmp/kubecube-member-kubeconfig-patch.yaml
+cat > "${cluster_creds_patch}" <<EOF
+spec:
+  kubeconfig: $(base64 -w 0 < "${member_agent_kubeconfig}")
+EOF
+
+if KUBECONFIG="${PIVOT_KUBECONFIG}" kubectl get cluster "${MEMBER_CLUSTER_NAME}" > /dev/null 2>&1; then
+  if KUBECONFIG="${PIVOT_KUBECONFIG}" kubectl patch cluster "${MEMBER_CLUSTER_NAME}" --type merge \
+    --patch-file "${cluster_creds_patch}" > /dev/null; then
+    clog info "registered the scoped credential on the pivot's Cluster ${MEMBER_CLUSTER_NAME}"
+  else
+    clog warn "could not write the scoped credential to the Cluster CR: the pivot keeps the credential it already has"
+  fi
+else
+  # Not a failure: the warden registers this cluster itself, and on a first
+  # install that has not happened yet. A later run finds the Cluster and writes it.
+  clog warn "the pivot has no Cluster ${MEMBER_CLUSTER_NAME} yet; it registers itself, so re-run this script to record the scoped credential"
+fi
+rm -f "${cluster_creds_patch}"
+
 # The chart's warden Service is a NodePort whose three ports (31443, 32444,
 # 32445) are hardcoded in the template with no values key. On a host that also
 # runs a pivot those ports already belong to the pivot's warden, and the
