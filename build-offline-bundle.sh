@@ -41,6 +41,14 @@ HELM_VERSION=${HELM_VERSION:-v3.14.4}
 KUBECTL_VERSION=${KUBECTL_VERSION:-v1.28.15}
 LOCAL_PATH_VERSION=${LOCAL_PATH_VERSION:-v0.0.28}
 CFSSL_VERSION=${CFSSL_VERSION:-v1.6.5}
+# The frontend image's two bases. Its Dockerfile pins them too; these are what the
+# builder pulls from a mirror this network can reach before building it.
+NODE_VERSION=${NODE_VERSION:-12.18.0}
+NGINX_VERSION=${NGINX_VERSION:-1.27}
+# Flipped to true by build_frontend_image when it actually builds that image, and
+# written into the bundle's install.conf. A bundle whose workspace has no
+# kubecube-front is still a valid bundle, with the feature off.
+FRONTEND_ENABLE=${FRONTEND_ENABLE:-false}
 
 INSTALLER_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
@@ -413,6 +421,7 @@ function build_platform_images() {
   build_cfssl_image
   build_kubectl_image
   build_cloudshell_image
+  build_frontend_image
 
   log "retagging the local path provisioner"
   pull_with_fallback "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/rancher-local-path-provisioner:${IMAGE_TAG}" \
@@ -510,6 +519,53 @@ function build_cloudshell_image() {
     --build-arg "BASE_IMG=${base_tag}" \
     -f "${ctx}/${ARCH}/Dockerfile" "${ctx}" > /dev/null \
     || die "could not build the cloudshell image for ${ARCH}"
+}
+
+# build_frontend_image builds the web UI image: a node stage that produces static
+# files, then nginx serving them. It is architecture-independent by construction —
+# the output is a directory of files, and only nginx has to match the node — but
+# the build itself is not, and two things about it are not obvious from the
+# Dockerfile:
+#
+#   * the builder stage is pinned with --platform=$BUILDPLATFORM so that a buildx
+#     release on an amd64 host does not emulate node. That pin needs the variable
+#     to be declared as a Dockerfile-level ARG to resolve at all; without the
+#     declaration it is empty and the build dies before its first layer with
+#     `failed to parse platform : "" is an invalid OS component`. buildx fills it
+#     in by itself, the plain builder does not, so it is passed here.
+#
+#   * node-sass v4.14.1 publishes no prebuilt binding for linux/arm64, so npm
+#     compiles it from source there: about four minutes of g++ in node:12.18.0 on
+#     a four-core VM, before webpack starts. This step is slow, and that is the
+#     reason rather than a hang.
+#
+# The source has to be in the workspace. Without it this skips, warns, and leaves
+# the feature off, so a bundle built from a workspace that has no kubecube-front
+# is still a bundle.
+function build_frontend_image() {
+  local ctx="${WORKSPACE}/kubecube-front"
+
+  if [ ! -f "${ctx}/Dockerfile" ]; then
+    warn "no ${ctx}/Dockerfile: skipping the frontend image, FRONTEND_ENABLE stays false"
+    return 0
+  fi
+
+  log "building the frontend image (node ${NODE_VERSION}, nginx ${NGINX_VERSION}, ${ARCH})"
+
+  # docker.io is not reachable from this network; the mirror is, so both bases are
+  # pulled from it and then tagged under the names the Dockerfile asks for.
+  docker pull "docker.1ms.run/library/node:${NODE_VERSION}" > /dev/null
+  docker tag "docker.1ms.run/library/node:${NODE_VERSION}" "node:${NODE_VERSION}"
+  docker pull "docker.1ms.run/library/nginx:${NGINX_VERSION}" > /dev/null
+  docker tag "docker.1ms.run/library/nginx:${NGINX_VERSION}" "nginx:${NGINX_VERSION}"
+
+  if docker build -t "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/frontend:${IMAGE_TAG}" \
+    --build-arg "BUILDPLATFORM=linux/${ARCH}" \
+    -f "${ctx}/Dockerfile" "${ctx}"; then
+    FRONTEND_ENABLE="true"
+  else
+    warn "could not build the frontend image: FRONTEND_ENABLE stays false"
+  fi
 }
 
 # --------------------------------------------------- k0s component images
@@ -629,6 +685,13 @@ function save_images() {
     "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/rancher-local-path-provisioner:${IMAGE_TAG}"
   )
 
+  # Only when it was built: build_frontend_image leaves the flag false on a
+  # workspace without the source, and saving an image that is not there fails the
+  # archive.
+  if [ "${FRONTEND_ENABLE}" = "true" ]; then
+    platform_images+=("${IMAGE_REGISTRY}/${IMAGE_PROJECT}/frontend:${IMAGE_TAG}")
+  fi
+
   local k0s_images=()
   local image
   while read -r image; do
@@ -740,12 +803,14 @@ EOF
 
   cat >> "${OUT}/manifests/install.conf" << EOF
 # The terminal image is built by build_cloudshell_image and carried in
-# platform.tar, so that feature can be on. The front end cannot yet: its image is
-# a node build, and while node-sass does compile on arm64 (measured: about four
-# minutes in node:12.18.0, which is what the Dockerfile's comment used to deny),
-# nothing in this builder builds it.
+# platform.tar, so that feature can be on.
+#
+# The front end follows its own build: build_frontend_image sets FRONTEND_ENABLE
+# when the source is in the workspace, and warns and leaves it false when it is
+# not, so a bundle built without kubecube-front is still a valid bundle rather
+# than a failed build.
 CLOUDSHELL_ENABLE="true"
-FRONTEND_ENABLE="false"
+FRONTEND_ENABLE="${FRONTEND_ENABLE}"
 
 # The bundle carries no arm64 ingress-controller image, so the chart must not
 # install its subchart: it would sit in ImagePullBackOff and take the whole
