@@ -412,6 +412,7 @@ function build_platform_images() {
   build_warden_init_image
   build_cfssl_image
   build_kubectl_image
+  build_cloudshell_image
 
   log "retagging the local path provisioner"
   pull_with_fallback "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/rancher-local-path-provisioner:${IMAGE_TAG}" \
@@ -478,6 +479,37 @@ COPY kubectl /usr/local/bin/kubectl
 EOF
   docker build -q -t "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/bitnami-kubectl:${IMAGE_TAG}" -f "${ctx}/Dockerfile.bundle" "${ctx}" > /dev/null
   rm -rf "${ctx}"
+}
+
+# build_cloudshell_image builds the terminal image the CloudShell feature runs.
+#
+# Two stages, because the repository builds it that way: cloudshell/base/Dockerfile
+# produces the base, and cloudshell/<arch>/Dockerfile takes it as BASE_IMG and
+# adds the kubectl the chroot copies. Both are built here rather than pulled — the
+# tag the arch Dockerfiles default to is local on purpose, and the base the
+# project used to publish sits on a registry that no longer answers, built from an
+# Ubuntu release whose archive is gone.
+#
+# The kubectl download inside the second stage is the slow part: dl.k8s.io serves
+# at roughly 40KB/s on this network, and the image wants its own copy for the
+# chroot rather than the one in ${OUT}/bin, which is a different architecture's
+# file in a cross build.
+function build_cloudshell_image() {
+  log "building the cloudshell image (base + ${ARCH})"
+
+  local base_tag="kubecube/cloudshell-base:24.04"
+  local ctx="${WORKSPACE}/kubecube-webconsole/cloudshell"
+
+  [ -f "${ctx}/base/Dockerfile" ] || die "no cloudshell base Dockerfile at ${ctx}/base/Dockerfile"
+  [ -f "${ctx}/${ARCH}/Dockerfile" ] || die "no cloudshell Dockerfile for ${ARCH}"
+
+  docker build -q -t "${base_tag}" -f "${ctx}/base/Dockerfile" "${ctx}" > /dev/null \
+    || die "could not build the cloudshell base image"
+
+  docker build -q -t "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/cloudshell:${IMAGE_TAG}" \
+    --build-arg "BASE_IMG=${base_tag}" \
+    -f "${ctx}/${ARCH}/Dockerfile" "${ctx}" > /dev/null \
+    || die "could not build the cloudshell image for ${ARCH}"
 }
 
 # --------------------------------------------------- k0s component images
@@ -593,6 +625,7 @@ function save_images() {
     "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/webconsole:${IMAGE_TAG}"
     "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/cfssl:${IMAGE_TAG}"
     "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/bitnami-kubectl:${IMAGE_TAG}"
+    "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/cloudshell:${IMAGE_TAG}"
     "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/rancher-local-path-provisioner:${IMAGE_TAG}"
   )
 
@@ -706,8 +739,12 @@ EOF
   fi
 
   cat >> "${OUT}/manifests/install.conf" << EOF
-# the arm64 bundle cannot build these two yet; see install.conf
-CLOUDSHELL_ENABLE="false"
+# The terminal image is built by build_cloudshell_image and carried in
+# platform.tar, so that feature can be on. The front end cannot yet: its image is
+# a node build, and while node-sass does compile on arm64 (measured: about four
+# minutes in node:12.18.0, which is what the Dockerfile's comment used to deny),
+# nothing in this builder builds it.
+CLOUDSHELL_ENABLE="true"
 FRONTEND_ENABLE="false"
 
 # The bundle carries no arm64 ingress-controller image, so the chart must not
