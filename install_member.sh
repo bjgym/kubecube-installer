@@ -198,7 +198,12 @@ global:
     warden: "true"
     audit: "false"
     webconsole: "false"
-    cloudshell: "false"
+    # The member runs its own shell. No extra permission is needed for that: the
+    # pod fetches the user's kubeconfig from the pivot at
+    # https://<global.nodeIP>:30443, and nodeIP above is already the pivot's host.
+    # Leaving this false makes every shell request fall back to the pivot's pod,
+    # which works but puts the session's jail and its pod in different clusters.
+    cloudshell: "true"
     frontend: "false"
 
   dependencesEnable:
