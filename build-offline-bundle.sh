@@ -126,15 +126,29 @@ function normalize_lines() {
 # --------------------------------------------------------------- preflight
 
 function preflight() {
+  # What the build needs depends on which build it is. A minimal build produces the
+  # distribution's own artefacts and skips build_k0s, build_charts and save_images, so
+  # go, helm and docker are never invoked and the component sources are never read.
+  # Requiring them anyway made minimal mode unreachable on the one kind of host it
+  # exists for - a build host without the component sources.
+  local tools="curl sha256sum python3"
+  local dirs=""
+  if [ "${BUNDLE_MINIMAL}" = "true" ]; then
+    log "minimal build: go, helm, docker and the component sources are not required"
+  else
+    tools="${tools} docker go helm"
+    dirs="KubeCube kubecube-audit kubecube-webconsole kubecube-chart hotplugs"
+  fi
+
   local missing=()
-  for cmd in docker go helm curl sha256sum python3; do
+  for cmd in ${tools}; do
     command -v "${cmd}" > /dev/null || missing+=("${cmd}")
   done
   if [ ${#missing[@]} -gt 0 ]; then
     die "missing tools: ${missing[*]}"
   fi
 
-  for dir in KubeCube kubecube-audit kubecube-webconsole kubecube-chart hotplugs; do
+  for dir in ${dirs}; do
     [ -d "${WORKSPACE}/${dir}" ] || die "${WORKSPACE}/${dir} is missing"
   done
 
@@ -142,8 +156,12 @@ function preflight() {
   log "bundle      : ${OUT}"
   log "arch        : ${ARCH}"
   log "image tag   : ${IMAGE_TAG}"
-  log "k0s         : ${K0S_VERSION} (${K0S_IMAGE})"
-  log "cilium      : ${CILIUM_VERSION}"
+  if [ "${BUNDLE_MINIMAL}" = "true" ]; then
+    log "mode        : minimal, distribution artefacts only"
+  else
+    log "k0s         : ${K0S_VERSION} (${K0S_IMAGE})"
+    log "cilium      : ${CILIUM_VERSION}"
+  fi
 }
 
 # fetch downloads a URL, treating a stalled connection as a failure.
