@@ -66,6 +66,16 @@ source <(sed 's/\r$//' "${INSTALLER_DIR}/install.conf")
 KUBERNETES_DISTRO=${BUNDLE_DISTRO:-${KUBERNETES_DISTRO}}
 KUBERNETES_VERSION=${BUNDLE_KUBERNETES_VERSION:-${KUBERNETES_VERSION}}
 
+# A minimal bundle skips build_k0s, so kubeadm is the only distro it can build. The
+# repository's install.conf defaults the distro to k0s, which means the default way to
+# run a minimal build skipped both distribution paths - build_k0s because the mode says
+# so, build_kubeadm_offline because the distro was not kubeadm - and still reported
+# "bundle ready": 94M and eighteen files, with no Kubernetes payload anywhere in it.
+# Refuse the combination instead of shipping the emptiness.
+if [ "${BUNDLE_MINIMAL}" = "true" ] && [ "${KUBERNETES_DISTRO}" != "kubeadm" ]; then
+  die "BUNDLE_MINIMAL=true builds a kubeadm bundle only, but KUBERNETES_DISTRO is '${KUBERNETES_DISTRO}'. Set BUNDLE_DISTRO=kubeadm: minimal mode skips build_k0s, so any other distro leaves the bundle with no distribution payload at all."
+fi
+
 # The kubeadm path installs calico and only calico: it applies
 # manifests/cni/<cni>/v<version>, and the offline package fetches the calico
 # manifest. Deciding it here rather than in one of the files written below keeps
