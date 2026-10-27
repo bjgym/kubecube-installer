@@ -52,6 +52,13 @@ To return a build host to "blank machine plus bundle" before an acceptance run:
 ./cleanup-blank.sh --yes    # do it
 ```
 
+### Verifying an install
+
+`hack/` holds the acceptance scripts that check a finished install (offline k0s
+and kubeadm, a staged bundle, pivot/member onboarding and the member
+credential), plus the egress blocker the offline checks use. See
+[hack/README.md](hack/README.md) for what each one proves and what it needs.
+
 ### Choosing the distribution and the CNI
 
 `install.conf` decides both. The defaults are k0s and Cilium.
