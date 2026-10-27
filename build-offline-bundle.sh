@@ -41,6 +41,8 @@ HELM_VERSION=${HELM_VERSION:-v3.14.4}
 KUBECTL_VERSION=${KUBECTL_VERSION:-v1.28.15}
 LOCAL_PATH_VERSION=${LOCAL_PATH_VERSION:-v0.0.28}
 CFSSL_VERSION=${CFSSL_VERSION:-v1.6.5}
+# The chart's metrics-server sub chart default; keep the two in step.
+METRICS_SERVER_VERSION=${METRICS_SERVER_VERSION:-v0.7.2}
 # The frontend image's two bases. Its Dockerfile pins them too; these are what the
 # builder pulls from a mirror this network can reach before building it.
 NODE_VERSION=${NODE_VERSION:-12.18.0}
@@ -450,6 +452,17 @@ function build_platform_images() {
     "docker.1ms.run/rancher/local-path-provisioner:${LOCAL_PATH_VERSION}" \
     "hub.rat.dev/rancher/local-path-provisioner:${LOCAL_PATH_VERSION}" \
     "docker.m.daocloud.io/rancher/local-path-provisioner:${LOCAL_PATH_VERSION}"
+
+  # The chart's metrics-server sub chart, from upstream rather than the Rancher
+  # repackaging it used to name. rancher-metrics-server:v0.4.1-m publishes only
+  # amd64, so on an arm64 node the kubelet cannot resolve the manifest list, treats
+  # the image as absent, tries to pull it, and the pod sits in ImagePullBackOff
+  # while every metric in the console stays zero. The sub chart's arguments and
+  # probes are upstream's flags, so this is a drop-in.
+  log "retagging metrics-server"
+  pull_with_fallback "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/metrics-server:${IMAGE_TAG}" \
+    "registry.k8s.io/metrics-server/metrics-server:${METRICS_SERVER_VERSION}" \
+    "registry.cn-hangzhou.aliyuncs.com/google_containers/metrics-server:${METRICS_SERVER_VERSION}"
 }
 
 # build_warden_init_image packages the third-party charts.
@@ -705,6 +718,7 @@ function save_images() {
     "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/bitnami-kubectl:${IMAGE_TAG}"
     "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/cloudshell:${IMAGE_TAG}"
     "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/rancher-local-path-provisioner:${IMAGE_TAG}"
+    "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/metrics-server:${IMAGE_TAG}"
   )
 
   # Only when it was built: build_frontend_image leaves the flag false on a

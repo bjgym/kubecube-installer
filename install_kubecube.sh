@@ -92,6 +92,7 @@ global:
     ingressController: ingress-nginx-controller:${KUBECUBE_IMAGE_TAG}
     ingressControllerJob: ingress-nginx-kube-webhook-certgen:${KUBECUBE_IMAGE_TAG}
     localPathStorageProvisioner: rancher-local-path-provisioner:${KUBECUBE_IMAGE_TAG}
+    metricsServer: metrics-server:${KUBECUBE_IMAGE_TAG}
     cfssl: cfssl:${KUBECUBE_IMAGE_TAG}
     kubectl: bitnami-kubectl:${KUBECUBE_IMAGE_TAG}
 

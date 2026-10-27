@@ -13,6 +13,19 @@ source /etc/kubecube/manifests/utils.sh
 
 RELEASE=v${KUBERNETES_VERSION}
 
+# The pod and service networks, both stated to kubeadm explicitly.
+#
+# Without a podSubnet kubeadm leaves Node.spec.podCIDR empty and the CNI decides
+# the range: Calico's own default pool is 192.168.0.0/16. On any host whose
+# network lives inside that range — 192.168.x is as common as it gets — pod IPs
+# then come out of the node's own subnet, the kubelet answers for addresses that
+# belong to pods, and services quietly land on the wrong host. It is a silent
+# failure: the cluster reports Ready and half of it works, which is how an arm64
+# metrics-server spent eleven days in ImagePullBackOff because its readiness
+# probe was dialling the node's own address.
+POD_CIDR=${POD_CIDR:-10.244.0.0/16}
+SERVICE_CIDR=${SERVICE_CIDR:-10.96.0.0/12}
+
 function docker_bin_get() {
   systemctl status docker|grep Active|grep -q running && { clog warn "docker is already running."; return 0; }
 
@@ -639,13 +652,10 @@ function images_download() {
 #
 # The k0s path learned this already; these are the same rules for kubeadm, with
 # the service CIDR added because a pod reaches the API server through its
-# ClusterIP rather than the node address. Two pod CIDRs are allowed because the
-# CNI decides that: calico's upstream manifest defaults to 192.168.0.0/16 and k0s
-# configures 10.244.0.0/16.
+# ClusterIP rather than the node address.
 function k8s_prepare_host_network() {
-  local pod_cidrs="10.244.0.0/16 192.168.0.0/16"
-  local service_cidr="10.96.0.0/12"
-  local pod_cidr
+  local pod_cidr="${POD_CIDR}"
+  local service_cidr="${SERVICE_CIDR}"
   local forward_policy
   forward_policy=$(iptables -S FORWARD | head -1)
 
@@ -654,10 +664,8 @@ function k8s_prepare_host_network() {
     clog warn "a host firewall is dropping pod traffic (FORWARD: ${forward_policy#-P }); allowing pod and service traffic through"
     iptables -P FORWARD ACCEPT
     iptables -I FORWARD 1 -s "${service_cidr}" -j ACCEPT
-    for pod_cidr in ${pod_cidrs}; do
-      iptables -I INPUT 1 -s "${pod_cidr}" -j ACCEPT
-      iptables -I FORWARD 1 -s "${pod_cidr}" -j ACCEPT
-    done
+    iptables -I INPUT 1 -s "${pod_cidr}" -j ACCEPT
+    iptables -I FORWARD 1 -s "${pod_cidr}" -j ACCEPT
 
     # The rules are lost when the firewall reloads, so they are re-applied every
     # time the kubelet starts — the one service every node runs.
@@ -668,10 +676,8 @@ function k8s_prepare_host_network() {
       echo '# (FORWARD). ufw drops both, and these rules do not survive a reload.'
       echo 'ExecStartPost=/sbin/iptables -P FORWARD ACCEPT'
       echo "ExecStartPost=/sbin/iptables -I FORWARD 1 -s ${service_cidr} -j ACCEPT"
-      for pod_cidr in ${pod_cidrs}; do
-        echo "ExecStartPost=/sbin/iptables -I INPUT 1 -s ${pod_cidr} -j ACCEPT"
-        echo "ExecStartPost=/sbin/iptables -I FORWARD 1 -s ${pod_cidr} -j ACCEPT"
-      done
+      echo "ExecStartPost=/sbin/iptables -I INPUT 1 -s ${pod_cidr} -j ACCEPT"
+      echo "ExecStartPost=/sbin/iptables -I FORWARD 1 -s ${pod_cidr} -j ACCEPT"
     } > /etc/systemd/system/kubelet.service.d/forward.conf
     systemctl daemon-reload
     clog info "pod traffic allowed; rules re-applied when the kubelet starts"
@@ -759,10 +765,37 @@ apiVersion: ${KUBEADM_API}
 kind: ClusterConfiguration
 kubernetesVersion: ${KUBERNETES_VERSION}
 controlPlaneEndpoint: ${CONTROL_PLANE_ENDPOINT}
+networking:
+  podSubnet: ${POD_CIDR}
+  serviceSubnet: ${SERVICE_CIDR}
 ${API_SERVER_CONF}
 ---
 ${KUBE_PROXY_CONF}
 EOF
+}
+
+# k8s_calico_pod_cidr makes Calico's IP pool the pod CIDR kubeadm was told.
+#
+# Calico ships its pool commented out and falls back to 192.168.0.0/16, so on a
+# host whose own network is inside that range the pool overlaps it. The two lines
+# are uncommented and set in the staged manifest, and the result is checked rather
+# than assumed: a calico release that renames them fails the install instead of
+# silently picking a pool that collides with the node's addresses.
+function k8s_calico_pod_cidr() {
+  local manifest="/etc/kubecube/manifests/cni/${CNI}/${RELEASE}"
+  [ "${CNI}" = "calico" ] || return 0
+  [ -f "${manifest}" ] || return 0
+
+  sed -i -E \
+    -e "s|^([[:space:]]*)# - name: CALICO_IPV4POOL_CIDR|\1- name: CALICO_IPV4POOL_CIDR|" \
+    -e "s|^([[:space:]]*)#   value: \"192.168.0.0/16\"|\1  value: \"${POD_CIDR}\"|" \
+    "${manifest}"
+
+  if ! grep -A1 -- "- name: CALICO_IPV4POOL_CIDR" "${manifest}" | grep -q "value: \"${POD_CIDR}\""; then
+    clog error "could not set CALICO_IPV4POOL_CIDR to ${POD_CIDR} in ${manifest}: this calico manifest no longer matches the pattern"
+    exit 1
+  fi
+  clog info "calico pod pool set to ${POD_CIDR}"
 }
 
 function Install_Kubernetes_Master (){
@@ -780,6 +813,7 @@ function Install_Kubernetes_Master (){
   chown "$(id -u):$(id -g)" "${HOME}/.kube/config"
 
   clog debug "installing cni ${CNI}"
+  k8s_calico_pod_cidr
   kubectl apply -f /etc/kubecube/manifests/cni/${CNI}/${RELEASE} > /dev/null
 
   sleep 7 >/dev/null

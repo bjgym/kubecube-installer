@@ -32,6 +32,14 @@
   scoped-credential acceptance, and the egress blocker they use
 
 ## BugFix
+- `install_k8s.sh` states the pod and service networks to kubeadm, and makes
+  Calico's IP pool match. Without a `podSubnet` kubeadm leaves
+  `Node.spec.podCIDR` empty and Calico falls back to its own `192.168.0.0/16`, so
+  on any host whose network lives inside that range pod IPs come out of the
+  node's own subnet: the kubelet answers for pod addresses, services land on the
+  wrong host, and the failure is silent because the node still reports Ready. The
+  host firewall no longer allows that pool as a workaround — it allows the
+  configured pod CIDR and the service CIDR, and nothing else
 - `entry.sh` checks the host for what the selected distribution actually needs.
   It demanded sshpass and conntrack from every host, and a fresh Ubuntu has
   neither, so a k0s install was refused before it started
@@ -41,6 +49,11 @@
   A template that emits a value into a base64 field carries a carriage return
   into that base64 when the file comes from a Windows checkout: YAML tolerates
   CRLF, a webhook's caBundle does not
+- `build-offline-bundle.sh` stages the metrics-server image the kubeadm path
+  needs, retagged from upstream v0.7.2 under the bundle's tag. The image the
+  chart used to name, `rancher-metrics-server:v0.4.1-m`, is amd64-only, so an
+  arm64 kubeadm install could never start it — and a minimal bundle carries no
+  platform images at all, so nothing staged it either
 
 # v1.3.1
 
