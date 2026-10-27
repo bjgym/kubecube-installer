@@ -791,7 +791,7 @@ function Install_Kubernetes_Master (){
   kubectl get pod --all-namespaces
 
   sleep 7 >/dev/null
-  clog deub "inspect service"
+  clog debug "inspect service"
   kubectl get svc --all-namespaces
 
   clog info "kubernetes ${KUBERNETES_VERSION} deploy completed"
