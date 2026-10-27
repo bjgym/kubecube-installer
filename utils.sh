@@ -72,7 +72,8 @@ function spin() {
 
 # cmd_must_exist check whether command is installed.
 function cmd_must_exist {
-    local CMD=$(command -v ${1})
+    local CMD
+    CMD=$(command -v "${1}")
     if [[ ! -x ${CMD} ]]; then
       echo "please install ${1} and verify they are in \$PATH."
       exit 1
@@ -110,7 +111,7 @@ function kubectl_with_retry() {
         kubectl "$@"
         ret=$?
         if [[ ${ret} -ne 0 ]]; then
-            echo "kubectl $@ failed, retrying(${i} times)"
+            echo "kubectl $* failed, retrying(${i} times)"
             sleep 1
             continue
         else
@@ -118,7 +119,7 @@ function kubectl_with_retry() {
         fi
     done
 
-    echo "kubectl $@ failed"
+    echo "kubectl $* failed"
     kubectl "$@"
     return ${ret}
 }

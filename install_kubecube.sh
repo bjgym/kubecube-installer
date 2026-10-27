@@ -36,7 +36,7 @@ if [ -z "${KUBECUBE_IMAGE_PROJECT}" ]; then
   KUBECUBE_IMAGE_PROJECT="kubecube"
 fi
 
-if [ $(kubectl get nodes | wc -l) -eq 2 ]
+if [ "$(kubectl get nodes | wc -l)" -eq 2 ]
 then
   # A one-node cluster has to run the platform's pods itself. k0s --single
   # already leaves the node untainted, so this only bites the kubeadm path; the

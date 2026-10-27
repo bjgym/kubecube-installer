@@ -1069,14 +1069,14 @@ function build_kubeadm_offline() {
   local from_manifest
   from_manifest=$(grep -oE 'image: *"?[^"[:space:]]+"?' "${dir}/calico.yaml" \
     | sed -E 's/image: *"?([^"]+)"?/\1/' | sort -u)
-  local missing=0
+  local missing_count=0
   for image in ${from_manifest}; do
     case " ${images[*]} " in
       *" ${image} "*) ;;
-      *) warn "the calico manifest names ${image}, which images.list does not"; missing=$((missing + 1)) ;;
+      *) warn "the calico manifest names ${image}, which images.list does not"; missing_count=$((missing_count + 1)) ;;
     esac
   done
-  if [ "${missing}" -gt 0 ]; then
+  if [ "${missing_count}" -gt 0 ]; then
     die "the calico manifest and images/k8s/v${KUBERNETES_VERSION}/images.list disagree"
   fi
 
@@ -1114,6 +1114,7 @@ function Main() {
   # there. Wiping the whole bundle made every retry re-download 200MB, which is
   # how one failing step turned into four attempts. Everything else is rebuilt
   # from scratch, so nothing stale can reach the manifest.
+  # shellcheck disable=SC2115  # OUT is assigned above with a default and set -u is on, so it cannot be empty here.
   rm -rf "${OUT}/bin" "${OUT}/charts" "${OUT}/k0s" "${OUT}/images" "${OUT}/manifests"
   mkdir -p "${OUT}"/{manifests,charts,k0s,images,bin}
 

@@ -777,7 +777,7 @@ function Install_Kubernetes_Master (){
 
   mkdir -p ${HOME}/.kube
   cp -i /etc/kubernetes/admin.conf ${HOME}/.kube/config
-  chown $(id -u):$(id -g) ${HOME}/.kube/config
+  chown "$(id -u):$(id -g)" "${HOME}/.kube/config"
 
   clog debug "installing cni ${CNI}"
   kubectl apply -f /etc/kubecube/manifests/cni/${CNI}/${RELEASE} > /dev/null
@@ -818,14 +818,14 @@ function Install_Kubernetes_Node (){
     clog error "ACCESS_PASSWORD or ACCESS_PRIVATE_KEY_PATH must be specified"
   fi
 
-  nodename=$(echo $(hostname) | tr 'A-Z' 'a-z')
+  nodename=$(hostname | tr 'A-Z' 'a-z')
 
   if [ ${NODE_MODE} = "node-join-control-plane" ]; then
     clog info "node join control plane as master"
     kubeadm join ${MASTER_IP}:6443 --token ${TOKEN} --discovery-token-ca-cert-hash sha256:${Hash} --control-plane --certificate-key ${CertificateKey}
     mkdir -p ${HOME}/.kube
     cp -i /etc/kubernetes/admin.conf ${HOME}/.kube/config
-    chown $(id -u):$(id -g) ${HOME}/.kube/config
+    chown "$(id -u):$(id -g)" "${HOME}/.kube/config"
   elif [ ${NODE_MODE} = "node-join-master" ]; then
     clog info "node join cluster as worker"
     kubeadm join ${MASTER_IP}:6443 --token ${TOKEN} --discovery-token-ca-cert-hash sha256:${Hash}
@@ -836,7 +836,7 @@ function Install_Kubernetes_Node (){
     fi
       mkdir -p ${HOME}/.kube
       cp -i /etc/kubernetes/kubelet.conf ${HOME}/.kube/config
-      chown $(id -u):$(id -g) ${HOME}/.kube/config
+      chown "$(id -u):$(id -g)" "${HOME}/.kube/config"
   fi
 }
 
@@ -867,9 +867,9 @@ function Main() {
 
   clog info "installing node MODE: ${NODE_MODE}"
 
-  if [ ${NODE_MODE} = "master" -o ${NODE_MODE} = "control-plane-master" ];then
+  if [ "${NODE_MODE}" = "master" ] || [ "${NODE_MODE}" = "control-plane-master" ];then
     Install_Kubernetes_Master
-  elif [ ${NODE_MODE} = "node-join-control-plane" -o ${NODE_MODE} = "node-join-master" ]; then
+  elif [ "${NODE_MODE}" = "node-join-control-plane" ] || [ "${NODE_MODE}" = "node-join-master" ]; then
     Install_Kubernetes_Node
   fi
 }

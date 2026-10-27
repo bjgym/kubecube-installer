@@ -188,7 +188,7 @@ fi
 
 # -------------------------------------------------------------------- online
 mkdir -p "${MANIFEST_BASE}/down" "${MANIFEST_BASE}/bin"
-cd "${MANIFEST_BASE}"
+cd "${MANIFEST_BASE}" || exit 1
 
 if [ -e "./manifests" ]; then
   echo -e "$(date +'%Y-%m-%d %H:%M:%S') \033[32mINFO\033[0m manifests and kubecube-chart already exist"
