@@ -32,6 +32,15 @@
   scoped-credential acceptance, and the egress blocker they use
 
 ## BugFix
+- `cleanup.sh` uninstalls what it says it uninstalls. Tested with `all` against a
+  live kubeadm cluster it reported "kubernetes uninstall success" and exited 0
+  while `kubeadm reset` had never run — it asks for a confirmation a script cannot
+  answer — and a running, enabled kubelet, thirteen calico interfaces, the
+  installer's pod-CIDR firewall rules and its kubelet drop-in all survived. It now
+  resets with `-f`, stops on a failed reset instead of continuing, disables the
+  kubelet and removes the drop-in, clears the CNI interfaces, routes and rules, and
+  on the platform side waits for the namespaces to terminate and deletes the
+  platform CRDs a release leaves behind
 - the cluster's pod and service networks are install.conf settings now
   (`POD_CIDR`, `SERVICE_CIDR`), read by both distributions: kubeadm hands them to
   `networking.podSubnet`/`serviceSubnet`, Calico's pool is set to the same pod
