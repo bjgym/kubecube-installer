@@ -134,13 +134,16 @@ function normalize_lines() {
 function preflight() {
   # What the build needs depends on which build it is. A minimal build produces the
   # distribution's own artefacts and skips build_k0s, build_charts and save_images, so
-  # go, helm and docker are never invoked and the component sources are never read.
-  # Requiring them anyway made minimal mode unreachable on the one kind of host it
-  # exists for - a build host without the component sources.
+  # go, helm and the component sources are never invoked. docker is not in that list:
+  # minimal mode still pulls the distribution's images and saves them into
+  # offline/offline_images.tar, which is what makes the bundle installable at all.
+  # Leaving docker out let a build start on a host that could not finish it, and the
+  # directory it left behind looked like a bundle.
   local tools="curl sha256sum python3"
   local dirs=""
   if [ "${BUNDLE_MINIMAL}" = "true" ]; then
-    log "minimal build: go, helm, docker and the component sources are not required"
+    tools="${tools} docker"
+    log "minimal build: go, helm and the component sources are not required"
   else
     tools="${tools} docker go helm"
     dirs="KubeCube kubecube-audit kubecube-webconsole kubecube-chart hotplugs"
@@ -1176,6 +1179,20 @@ function Main() {
   build_binaries
   if [ "${KUBERNETES_DISTRO}" = "kubeadm" ]; then
     build_kubeadm_offline
+
+    # A kubeadm bundle is only a bundle if it can install a cluster, and the pieces
+    # that make it one used to go unchecked: a directory tree with the binaries and
+    # no images was indistinguishable from a finished build. `offline/` is where the
+    # minimal mode carries them, and nothing downstream can substitute for a missing
+    # image on a machine with no registry.
+    local missing=""
+    for f in offline/offline_images.tar offline/kubeadm offline/kubelet offline/kubectl \
+      manifests/cni/calico/v${KUBERNETES_VERSION}/calico.yaml; do
+      [ -s "${OUT}/${f}" ] || missing="${missing} ${f}"
+    done
+    if [ -n "${missing}" ]; then
+      die "the kubeadm package is incomplete; missing or empty:${missing}"
+    fi
   fi
   # a minimal bundle carries the kubeadm images inside offline/ instead
   if [ "${BUNDLE_MINIMAL}" != "true" ]; then
