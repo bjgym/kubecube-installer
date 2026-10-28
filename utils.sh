@@ -338,3 +338,101 @@ EOF
   openssl x509 -req -in tls.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out tls.crt -days 10000 -extensions v3_ext -extfile csr.conf
   cd ..
 }
+
+# --- the cluster's pod and service networks ----------------------------------
+#
+# POD_CIDR and SERVICE_CIDR are the one place both distributions read these from.
+# kubeadm is told them as networking.podSubnet/serviceSubnet, Calico's IP pool is
+# set to the same pod CIDR, and k0s writes them into its own config. The check
+# below exists because the failure it prevents is silent: a pod network that
+# overlaps the node's own network hands pods addresses the node already answers
+# for, services land on the wrong host, and the cluster still reports Ready.
+
+# ip_to_int prints a dotted quad as an integer.
+ip_to_int() {
+  local IFS=.
+  # shellcheck disable=SC2086  # splitting the quad is the point
+  local o=($1)
+  echo $(( (o[0] << 24) + (o[1] << 16) + (o[2] << 8) + o[3] ))
+}
+
+# cidr_bounds prints "<network> <broadcast>" for a CIDR, both as integers.
+cidr_bounds() {
+  local bits=${1#*/} base mask
+  base=$(ip_to_int "${1%/*}")
+  mask=0
+  if [ "${bits}" -gt 0 ]; then
+    mask=$(( (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+  fi
+  echo $(( base & mask )) $(( (base & mask) | (~mask & 0xFFFFFFFF) ))
+}
+
+# cidr_contains succeeds when the address sits inside the CIDR.
+cidr_contains() {
+  local bounds net bcast ip
+  ip=$(ip_to_int "$2")
+  bounds=$(cidr_bounds "$1")
+  net=${bounds% *}
+  bcast=${bounds#* }
+  [ "${ip}" -ge "${net}" ] && [ "${ip}" -le "${bcast}" ]
+}
+
+# cidr_overlaps succeeds when two CIDRs share an address.
+cidr_overlaps() {
+  local a b an ab bn bb
+  a=$(cidr_bounds "$1")
+  b=$(cidr_bounds "$2")
+  an=${a% *}; ab=${a#* }
+  bn=${b% *}; bb=${b#* }
+  [ "${an}" -le "${bb}" ] && [ "${bn}" -le "${ab}" ]
+}
+
+# validate_cidr refuses anything that is not an IPv4 network of /8 to /30.
+validate_cidr() {
+  local cidr=$1 bits name=${2:-$1}
+  if ! [[ "${cidr}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+    clog error "${name} '${cidr}' is not an IPv4 CIDR (expected e.g. 10.244.0.0/16)"
+    exit 1
+  fi
+  bits=${cidr#*/}
+  if [ "${bits}" -lt 8 ] || [ "${bits}" -gt 30 ]; then
+    clog error "${name} '${cidr}' has a /${bits} prefix; a cluster network is /8 to /30"
+    exit 1
+  fi
+}
+
+# check_cluster_cidrs validates the pair and refuses one that holds this node's
+# own addresses.
+#
+# It is meant for a blank host. On a machine that already runs a cluster the node
+# holds its own pod addresses, and the check reports them — re-running the
+# installer over an existing cluster is not supported anyway.
+check_cluster_cidrs() {
+  local pod=${POD_CIDR:-10.244.0.0/16}
+  local svc=${SERVICE_CIDR:-10.96.0.0/12}
+  local addr
+
+  validate_cidr "${pod}" "POD_CIDR"
+  validate_cidr "${svc}" "SERVICE_CIDR"
+
+  if cidr_overlaps "${pod}" "${svc}"; then
+    clog error "POD_CIDR ${pod} overlaps SERVICE_CIDR ${svc}; the two networks have to be disjoint"
+    exit 1
+  fi
+
+  for addr in $(hostname -I 2>/dev/null); do
+    case "${addr}" in
+      *:*) continue ;;  # IPv6 is not what these variables describe
+    esac
+    if cidr_contains "${pod}" "${addr}"; then
+      clog error "POD_CIDR ${pod} contains this node's own address ${addr}: pods would be handed addresses the node answers for. Pick a pod network outside the node's subnet, e.g. 172.20.0.0/16 or 100.64.0.0/16"
+      exit 1
+    fi
+    if cidr_contains "${svc}" "${addr}"; then
+      clog error "SERVICE_CIDR ${svc} contains this node's own address ${addr}; pick a service network outside the node's subnet"
+      exit 1
+    fi
+  done
+
+  clog info "cluster networks: pods ${pod}, services ${svc}"
+}

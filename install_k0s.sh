@@ -30,8 +30,8 @@ source /etc/kubecube/manifests/install.conf
 K0S_BIN="/usr/local/bin/k0s"
 K0S_CONFIG="/etc/k0s/k0s.yaml"
 K0S_API_PORT="6443"
-K0S_POD_CIDR="10.244.0.0/16"
-K0S_SERVICE_CIDR="10.96.0.0/12"
+K0S_POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
+K0S_SERVICE_CIDR="${SERVICE_CIDR:-10.96.0.0/12}"
 K0S_READY_TIMEOUT=600
 CILIUM_CHART_DIR="${OFFLINE_BUNDLE_DIR}/charts/cilium"
 
@@ -131,6 +131,9 @@ function k0s_check_config() {
     clog error "OFFLINE=true but ${OFFLINE_BUNDLE_DIR} does not exist"
     exit 1
   fi
+
+  # The same pair the kubeadm path validates, from the same install.conf keys.
+  check_cluster_cidrs
 }
 
 # k0s_bin_install places the k0s binary. Offline it comes from the bundle and is

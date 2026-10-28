@@ -32,6 +32,14 @@
   scoped-credential acceptance, and the egress blocker they use
 
 ## BugFix
+- the cluster's pod and service networks are install.conf settings now
+  (`POD_CIDR`, `SERVICE_CIDR`), read by both distributions: kubeadm hands them to
+  `networking.podSubnet`/`serviceSubnet`, Calico's pool is set to the same pod
+  CIDR (whichever form the release ships it in), and k0s writes them into its own
+  config instead of the values it used to hard-code. The installer validates the
+  pair at startup: an address inside the node's own subnet, or a pod network that
+  overlaps the service network, stops the install instead of producing a cluster
+  that reports Ready while pods hold the node's own addresses
 - `install_k8s.sh` states the pod and service networks to kubeadm, and makes
   Calico's IP pool match. Without a `podSubnet` kubeadm leaves
   `Node.spec.podCIDR` empty and Calico falls back to its own `192.168.0.0/16`, so

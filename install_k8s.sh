@@ -687,6 +687,8 @@ function k8s_prepare_host_network() {
 function preparation() {
   clog info "doing previous preparation"
 
+  check_cluster_cidrs
+
   k8s_prepare_host_network
 
   clog debug "closing swap"
@@ -789,6 +791,12 @@ function k8s_calico_pod_cidr() {
   sed -i -E \
     -e "s|^([[:space:]]*)# - name: CALICO_IPV4POOL_CIDR|\1- name: CALICO_IPV4POOL_CIDR|" \
     -e "s|^([[:space:]]*)#   value: \"192.168.0.0/16\"|\1  value: \"${POD_CIDR}\"|" \
+    "${manifest}"
+
+  # A manifest that ships the value already uncommented: make it ours as well, so
+  # a custom POD_CIDR applies whichever form the calico release uses.
+  sed -i -E \
+    -e "/- name: CALICO_IPV4POOL_CIDR/{n;s|^([[:space:]]*)value: .*|\1value: \"${POD_CIDR}\"|}" \
     "${manifest}"
 
   if ! grep -A1 -- "- name: CALICO_IPV4POOL_CIDR" "${manifest}" | grep -q "value: \"${POD_CIDR}\""; then
