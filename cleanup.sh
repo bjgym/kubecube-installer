@@ -70,24 +70,31 @@ function kubernetes_uninstall() {
   local dev
   ip link show 2>/dev/null | awk -F': ' '/cali|cilium|tunl0|cni0|lxc/ {print $2}' | while read -r dev; do
     dev=${dev%%@*}
-    # tunl0 is an ipip tunnel, and `ip link delete` refuses it; the tunnel command is
-    # the one that removes it.
-    if [ "${dev}" = "tunl0" ]; then
-      ip tunnel del "${dev}" > /dev/null 2>&1 || ip link delete "${dev}" > /dev/null 2>&1 || true
-    else
-      ip link delete "${dev}" > /dev/null 2>&1 || true
-    fi
+    ip link set "${dev}" down > /dev/null 2>&1 || true
+    ip link delete "${dev}" > /dev/null 2>&1 || true
   done
+
+  # tunl0 is the ipip module's default device: `ip link delete tunl0` returns 0 and
+  # it is back the moment anything loads the module again, so the module goes.
+  modprobe -r ipip > /dev/null 2>&1 || true
   # Both the networks this cluster was configured with and the distribution defaults:
   # a cluster that was installed with a custom pod network and then had its config
   # replaced still has rules for the old one, and a leftover rule is exactly what
   # this cleanup exists to remove.
-  local cidr
+  #
+  # The snapshot is taken first, then deleted line by line. Piping `iptables -S` into
+  # `grep -q` looked fine and never worked: grep exits on the first match, iptables
+  # dies of SIGPIPE, and with `set -o pipefail` the pipeline reports 141 — so the
+  # condition was false for a rule that was plainly there.
+  local cidr rules rule
   for cidr in "${NET_POD_CIDR}" "${NET_SERVICE_CIDR}" 10.244.0.0/16 10.96.0.0/12; do
     [ -n "${cidr}" ] || continue
-    if iptables -S 2>/dev/null | grep -q -- "-s ${cidr} "; then
-      iptables -S | grep -- "-s ${cidr} " | sed 's/^-A /-D /' | xargs -r -L1 iptables > /dev/null 2>&1 || true
-    fi
+    rules=$(iptables -S 2> /dev/null | grep -- "-s ${cidr} " || true)
+    [ -n "${rules}" ] || continue
+    while IFS= read -r rule; do
+      # -A INPUT ... -> -D INPUT ... (replace the prefix, do not just strip it)
+      iptables ${rule/#-A /-D } > /dev/null 2>&1 || true
+    done <<< "${rules}"
     ip route del "${cidr}" > /dev/null 2>&1 || true
   done
 
