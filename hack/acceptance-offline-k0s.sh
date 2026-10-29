@@ -206,6 +206,45 @@ for c in cube warden audit webconsole; do
   fi
 done
 
+# ------------------------------------------------------------------ the release
+
+# The release and its webhooks, because a failed release with the pods up is exactly
+# what an earlier install left behind: the four components ran, helm had given up, and
+# the admission webhooks the platform depends on had never been applied.
+section "release and webhooks"
+helm -n "${NS}" status kubecube > "${EVID}/35-release.txt" 2>&1 || true
+release_status=$(awk '/^STATUS:/ {print $2}' "${EVID}/35-release.txt" 2> /dev/null || true)
+if [ "${release_status}" = "deployed" ]; then
+  ok "release is deployed"
+else
+  bad "release status is '${release_status:-unknown}', expected deployed"
+fi
+
+if kubectl get validatingwebhookconfigurations -o name 2> /dev/null | grep -q kubecube-validating-webhook-configuration; then
+  ok "the platform's webhook configuration exists"
+else
+  bad "the platform's webhook configuration is missing"
+fi
+if kubectl get validatingwebhookconfigurations -o name 2> /dev/null | grep -q warden-validating-webhook-configuration; then
+  ok "the warden's webhook configuration exists"
+else
+  bad "the warden's webhook configuration is missing"
+fi
+
+# 7 Fail and 2 Ignore is what the chart renders: five platform webhooks, four warden
+# ones, and one Ignore in each. A count mismatch means a webhook is missing or a
+# policy drifted, and both are the difference between the control plane validating
+# quota and not validating it.
+policies=$(kubectl get validatingwebhookconfigurations \
+  -o jsonpath='{.items[*].webhooks[*].failurePolicy}' 2> /dev/null || true)
+fails=$(printf '%s\n' ${policies} | grep -c '^Fail$' || true)
+ignores=$(printf '%s\n' ${policies} | grep -c '^Ignore$' || true)
+if [ "${fails}" -eq 7 ] && [ "${ignores}" -eq 2 ]; then
+  ok "webhook failurePolicy matches the chart: 7 Fail, 2 Ignore"
+else
+  bad "webhook failurePolicy is ${fails} Fail and ${ignores} Ignore; the chart renders 7 and 2"
+fi
+
 # ------------------------------------------------------------------- the API
 
 section "platform api"
