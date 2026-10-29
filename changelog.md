@@ -25,8 +25,11 @@
   defaults: the hotplugs are off (they pull several gigabytes this installer
   never stages), only the four components it has images for are on, the image
   tag comes from the bundle, and helm is asked to wait so a failed install fails
-- `images/k0s/<version>/images.list` and its CNI companions hold the images k0s
-  pulls, next to the existing `images/k8s/<version>/images.list`
+- the arm64 frontend image was built and measured: with the command
+  `build_frontend_image` runs — plain `docker build`, `BUILDPLATFORM` passed as a
+  build argument, no buildx — it takes about eleven minutes, four of them node-sass
+  compiling from source, and nginx serves `public/index.html` with a 200
+- `images/k0s/<version>/images.list` and its CNI companions hold the images k0s  pulls, next to the existing `images/k8s/<version>/images.list`
 - `hack/` carries the acceptance scripts: offline install checks for k0s and for
   kubeadm, a bundle smoke test, the pivot/member onboarding acceptance, the
   scoped-credential acceptance, and the egress blocker they use
