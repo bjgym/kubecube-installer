@@ -25,8 +25,10 @@ function kubecube_uninstall() {
   clog debug "delete the platform's CRDs"
   kubectl get crd -o name 2>/dev/null | grep -e kubecube.io | xargs -r kubectl delete --ignore-not-found --wait=false || true
 
-  clog debug "remove kubecube files"
-  rm -rf /etc/kubecube
+  # /etc/kubecube is deleted in main(), after kubernetes_uninstall has read the
+  # cluster's networks from it. Deleting it here meant a second teardown found no
+  # conf, fell back to the defaults, and left the previous cluster's firewall rules
+  # in place — which is exactly what a teardown of a custom-network cluster hit.
 
   clog info "kubecube uninstall success"
 }
@@ -67,7 +69,14 @@ function kubernetes_uninstall() {
   clog debug "remove cni leftovers"
   local dev
   ip link show 2>/dev/null | awk -F': ' '/cali|cilium|tunl0|cni0|lxc/ {print $2}' | while read -r dev; do
-    ip link delete "${dev%%@*}" > /dev/null 2>&1 || true
+    dev=${dev%%@*}
+    # tunl0 is an ipip tunnel, and `ip link delete` refuses it; the tunnel command is
+    # the one that removes it.
+    if [ "${dev}" = "tunl0" ]; then
+      ip tunnel del "${dev}" > /dev/null 2>&1 || ip link delete "${dev}" > /dev/null 2>&1 || true
+    else
+      ip link delete "${dev}" > /dev/null 2>&1 || true
+    fi
   done
   # Both the networks this cluster was configured with and the distribution defaults:
   # a cluster that was installed with a custom pod network and then had its config
@@ -175,8 +184,11 @@ function main() {
   NET_POD_CIDR=""
   NET_SERVICE_CIDR=""
   if [ -f /etc/kubecube/manifests/install.conf ]; then
-    NET_POD_CIDR=$(grep -E '^POD_CIDR=' /etc/kubecube/manifests/install.conf | tail -1 | cut -d'"' -f2)
-    NET_SERVICE_CIDR=$(grep -E '^SERVICE_CIDR=' /etc/kubecube/manifests/install.conf | tail -1 | cut -d'"' -f2)
+    # tr -d '\r': the conf has been CRLF on every build made from a Windows
+    # checkout, and a CIDR read with a trailing carriage return matches no rule at
+    # all — the sweep ran, found nothing, and left twelve rules behind.
+    NET_POD_CIDR=$(grep -E '^POD_CIDR=' /etc/kubecube/manifests/install.conf | tail -1 | cut -d'"' -f2 | tr -d '\r')
+    NET_SERVICE_CIDR=$(grep -E '^SERVICE_CIDR=' /etc/kubecube/manifests/install.conf | tail -1 | cut -d'"' -f2 | tr -d '\r')
   fi
   NET_POD_CIDR=${NET_POD_CIDR:-10.244.0.0/16}
   NET_SERVICE_CIDR=${NET_SERVICE_CIDR:-10.96.0.0/12}
@@ -202,6 +214,10 @@ function main() {
       echo "unknown params, only support: 'kubecube','k8s','docker','containerd','all'"
     ;;
   esac
+
+  # Delete the installer's own configuration only after the uninstallers have read
+  # what they need from it — kubernetes_uninstall reads the cluster's networks there.
+  rm -rf /etc/kubecube
 }
 
 main
