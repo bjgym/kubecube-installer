@@ -821,6 +821,15 @@ function Install_Kubernetes_Master (){
   chown "$(id -u):$(id -g)" "${HOME}/.kube/config"
 
   clog debug "installing cni ${CNI}"
+  # Two sources feed this path. The repository curates calico manifests up to 1.26
+  # (`cni/calico/v<version>/`); 1.27 and later take the upstream manifest at build
+  # time, from the version `images/k8s/v<version>/images.list` names. Whichever built
+  # this bundle, the manifest has to be here — and saying so is better than letting
+  # kubectl report a path it cannot open.
+  if [ ! -f "/etc/kubecube/manifests/cni/${CNI}/${RELEASE}" ]; then
+    clog error "no ${CNI} manifest for ${RELEASE} at /etc/kubecube/manifests/cni/${CNI}/${RELEASE}: the repository curates them up to 1.26 and later versions come from the upstream manifest the builder fetches, so this bundle was built without one"
+    exit 1
+  fi
   k8s_calico_pod_cidr
   kubectl apply -f /etc/kubecube/manifests/cni/${CNI}/${RELEASE} > /dev/null
 
