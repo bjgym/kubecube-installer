@@ -420,10 +420,17 @@ check_cluster_cidrs() {
     exit 1
   fi
 
-  for addr in $(hostname -I 2>/dev/null); do
-    case "${addr}" in
-      *:*) continue ;;  # IPv6 is not what these variables describe
-    esac
+  # The node's addresses come from the interfaces, not from `hostname -I`: that one
+  # answers with the addresses resolved for the hostname, and on this very machine
+  # it omitted the second NIC — the exact address a pod network must not contain.
+  # Interfaces the CNI and docker create are skipped so a leftover pod address is
+  # not mistaken for the node's.
+  local addrs
+  addrs=$(ip -4 -o addr show 2> /dev/null \
+    | awk '$2 !~ /^(cali|veth|docker|cni0|tunl0|cilium|lxc|flannel)/ {print $4}' \
+    | cut -d/ -f1)
+
+  for addr in ${addrs}; do
     if cidr_contains "${pod}" "${addr}"; then
       clog error "POD_CIDR ${pod} contains this node's own address ${addr}: pods would be handed addresses the node answers for. Pick a pod network outside the node's subnet, e.g. 172.20.0.0/16 or 100.64.0.0/16"
       exit 1

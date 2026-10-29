@@ -877,6 +877,13 @@ INGRESS_CONTROLLER_ENABLE="false"
 EOF
   cp -a "${OUT}/manifests/install.conf" "${OUT}/install.conf"
 
+  # The conf is sourced on the target, and one carriage return is enough to make it
+  # read wrong: `[ ${NODE_MODE} = master ]` compares "master\r" and refuses the
+  # install with "NODE_MODE illegal" over a line that plainly says master. The
+  # scripts and the chart are normalised above; this file has to be too, because a
+  # bundle built from a Windows checkout carries the CRLF the checkout has.
+  sed -i 's/\r$//' "${OUT}/install.conf"
+
   # checksums over everything that is not the manifest itself
   (cd "${OUT}" && find . -type f ! -name bundle.manifest -printf '%P\n' \
     | sort \

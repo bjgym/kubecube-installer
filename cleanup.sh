@@ -38,10 +38,17 @@ function kubernetes_uninstall() {
   # it. Without the flag the reset did nothing at all, and this function then
   # deleted /etc/kubernetes and the binaries and reported success over a cluster
   # that was still running.
+  #
+  # A second run finds no kubeadm — the first run deleted it — and that is a cluster
+  # already reset, not a failure.
   clog debug "kubernetes reset"
-  if ! kubeadm reset -f; then
-    clog error "kubeadm reset failed; stopping rather than leaving a half-uninstalled node"
-    exit 1
+  if command -v kubeadm > /dev/null 2>&1; then
+    if ! kubeadm reset -f; then
+      clog error "kubeadm reset failed; stopping rather than leaving a half-uninstalled node"
+      exit 1
+    fi
+  else
+    clog warn "kubeadm is not installed; there is no cluster left to reset"
   fi
 
   # The kubelet outlives the reset: it stays enabled and keeps restarting against a
@@ -52,19 +59,28 @@ function kubernetes_uninstall() {
   systemctl daemon-reload
 
   # The CNI leaves interfaces, routes and the firewall rules the installer added.
+  #
+  # The interfaces print as "cali1234@if3": the peer suffix is not part of the name,
+  # and passing it to `ip link delete` fails, which is why thirteen of them survived
+  # the first version of this. Both networks are cleared because the installer allows
+  # the pod CIDR on INPUT and FORWARD and the service CIDR on FORWARD.
   clog debug "remove cni leftovers"
-  local pod_cidr=""
-  if [ -f /etc/kubecube/manifests/install.conf ]; then
-    pod_cidr=$(grep -E '^POD_CIDR=' /etc/kubecube/manifests/install.conf | tail -1 | cut -d'"' -f2)
-  fi
-  pod_cidr=${pod_cidr:-10.244.0.0/16}
+  local dev
   ip link show 2>/dev/null | awk -F': ' '/cali|cilium|tunl0|cni0|lxc/ {print $2}' | while read -r dev; do
-    ip link delete "${dev}" > /dev/null 2>&1 || true
+    ip link delete "${dev%%@*}" > /dev/null 2>&1 || true
   done
-  if iptables -S 2>/dev/null | grep -q -- "-s ${pod_cidr} "; then
-    iptables -S | grep -- "-s ${pod_cidr} " | sed 's/^-A /-D /' | xargs -r -L1 iptables > /dev/null 2>&1 || true
-  fi
-  ip route del "${pod_cidr}" > /dev/null 2>&1 || true
+  # Both the networks this cluster was configured with and the distribution defaults:
+  # a cluster that was installed with a custom pod network and then had its config
+  # replaced still has rules for the old one, and a leftover rule is exactly what
+  # this cleanup exists to remove.
+  local cidr
+  for cidr in "${NET_POD_CIDR}" "${NET_SERVICE_CIDR}" 10.244.0.0/16 10.96.0.0/12; do
+    [ -n "${cidr}" ] || continue
+    if iptables -S 2>/dev/null | grep -q -- "-s ${cidr} "; then
+      iptables -S | grep -- "-s ${cidr} " | sed 's/^-A /-D /' | xargs -r -L1 iptables > /dev/null 2>&1 || true
+    fi
+    ip route del "${cidr}" > /dev/null 2>&1 || true
+  done
 
   clog debug "delete residual files of kubernetes"
   rm -rf /etc/kubernetes/
@@ -153,6 +169,18 @@ function clog() {
 }
 
 function main() {
+  # Read the cluster's networks before kubecube_uninstall deletes /etc/kubecube: the
+  # CNI cleanup needs the networks the installer configured, and their defaults are
+  # not what every cluster uses.
+  NET_POD_CIDR=""
+  NET_SERVICE_CIDR=""
+  if [ -f /etc/kubecube/manifests/install.conf ]; then
+    NET_POD_CIDR=$(grep -E '^POD_CIDR=' /etc/kubecube/manifests/install.conf | tail -1 | cut -d'"' -f2)
+    NET_SERVICE_CIDR=$(grep -E '^SERVICE_CIDR=' /etc/kubecube/manifests/install.conf | tail -1 | cut -d'"' -f2)
+  fi
+  NET_POD_CIDR=${NET_POD_CIDR:-10.244.0.0/16}
+  NET_SERVICE_CIDR=${NET_SERVICE_CIDR:-10.96.0.0/12}
+
   case ${OPT} in
     "kubecube") kubecube_uninstall
     ;;
