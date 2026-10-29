@@ -190,6 +190,21 @@ case "${ans}" in
   *) rec "?     credential: get resourcequotas -> ${ans:-no answer}" ;;
 esac
 
+# ---- the delete half of the walk, done with the credential itself ------------
+# The create above proves the credential can make a space. Deleting one is the other
+# half of the walk the platform performs, and `auth can-i delete` only says the rule
+# exists — this asks the member's apiserver to actually carry it out, on the
+# namespace the create just made.
+if [ "${created}" -eq 1 ]; then
+  say "4. the credential deletes the space it created"
+  if kctl --kubeconfig "${CRED}" delete namespace "${NS}" --wait=true --timeout=120s > /dev/null 2>&1; then
+    rec "ok    credential deleted namespace ${NS}"
+    created=0
+  else
+    rec "GAP   credential could not delete namespace ${NS} it created"
+  fi
+fi
+
 # ---- leave the member as it was found ---------------------------------------
 if [ "${created}" -eq 1 ] && [ "${CLEANUP}" -eq 1 ]; then
   say "cleanup"
