@@ -462,10 +462,22 @@ function build_platform_images() {
   # the image as absent, tries to pull it, and the pod sits in ImagePullBackOff
   # while every metric in the console stays zero. The sub chart's arguments and
   # probes are upstream's flags, so this is a drop-in.
-  log "retagging metrics-server"
-  pull_with_fallback "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/metrics-server:${IMAGE_TAG}" \
-    "registry.k8s.io/metrics-server/metrics-server:${METRICS_SERVER_VERSION}" \
-    "registry.cn-hangzhou.aliyuncs.com/google_containers/metrics-server:${METRICS_SERVER_VERSION}"
+  #
+  # The reference is the one the installer asks for (see metrics_server_image), so
+  # the release pulls exactly what this bundle carries.
+  log "staging metrics-server ($(metrics_server_image))"
+  pull_with_fallback "$(metrics_server_image)" "$(metrics_server_image)"
+}
+
+# metrics_server_image prints the reference both this bundle and the installer use:
+# the public mirror on a cn build, the project's own name elsewhere. A full reference
+# is what the chart's sub chart takes as written.
+function metrics_server_image() {
+  if [ "${ZONE:-}" = "cn" ]; then
+    echo "registry.cn-hangzhou.aliyuncs.com/google_containers/metrics-server:${METRICS_SERVER_VERSION}"
+  else
+    echo "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/metrics-server:${IMAGE_TAG}"
+  fi
 }
 
 # build_warden_init_image packages the third-party charts.
@@ -721,7 +733,7 @@ function save_images() {
     "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/bitnami-kubectl:${IMAGE_TAG}"
     "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/cloudshell:${IMAGE_TAG}"
     "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/rancher-local-path-provisioner:${IMAGE_TAG}"
-    "${IMAGE_REGISTRY}/${IMAGE_PROJECT}/metrics-server:${IMAGE_TAG}"
+    "$(metrics_server_image)"
   )
 
   # Only when it was built: build_frontend_image leaves the flag false on a

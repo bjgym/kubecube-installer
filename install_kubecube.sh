@@ -63,6 +63,17 @@ function render_values() {
     metric_server="false"
   fi
 
+  # The metrics-server reference, chosen the way the bundle chose it: the public
+  # mirror on a cn build, the project's own name elsewhere. A value that names a
+  # registry is used as written by the sub chart, so the release pulls exactly what
+  # the bundle carries.
+  local metrics_server_image
+  if [ "${ZONE}" = "cn" ]; then
+    metrics_server_image="registry.cn-hangzhou.aliyuncs.com/google_containers/metrics-server:v0.7.2"
+  else
+    metrics_server_image="metrics-server:${KUBECUBE_IMAGE_TAG}"
+  fi
+
   clog info "render pivot values for kubecube chart values (image tag ${KUBECUBE_IMAGE_TAG})"
 cat > render-values.yaml <<EOF
 # pivot-value.yaml
@@ -92,7 +103,7 @@ global:
     ingressController: ingress-nginx-controller:${KUBECUBE_IMAGE_TAG}
     ingressControllerJob: ingress-nginx-kube-webhook-certgen:${KUBECUBE_IMAGE_TAG}
     localPathStorageProvisioner: rancher-local-path-provisioner:${KUBECUBE_IMAGE_TAG}
-    metricsServer: metrics-server:${KUBECUBE_IMAGE_TAG}
+    metricsServer: ${metrics_server_image}
     cfssl: cfssl:${KUBECUBE_IMAGE_TAG}
     kubectl: bitnami-kubectl:${KUBECUBE_IMAGE_TAG}
 
